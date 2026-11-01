@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Shared shapes. The envelope matches SPEC section 6.1.
 
-export const VERSION = "1.0.0"
+export const VERSION = "1.0.1"
 // Bump when the reader changes what it extracts, so older cached pages are re-read.
-export const PARSER_VERSION = 14; // 14: v0.9.1 sweep ("(JSON)" heading generated, list indentation capped at 8 levels, markdown code kept as preformatted, nesting past 256 flattened). 13: v0.9 labels Tiresias makes ("(top of page)", "(structured data)") are marked generated, never quoted. 12: v0.7 language (W-26). 11: v0.6 calendar events (ics.ts). 10: v0.5.1 JSON as line blocks, W-22 reader. 9: W-20 file kinds (scripts, CSV, calendars and contacts read as plain text; SVG; file flags)
+export const PARSER_VERSION = 15; // 15: v1.0.1 reader fixes. 14: v0.9.1 sweep ("(JSON)" heading generated, list indentation capped at 8 levels, markdown code kept as preformatted, nesting past 256 flattened). 13: v0.9 labels Tiresias makes ("(top of page)", "(structured data)") are marked generated, never quoted. 12: v0.7 language (W-26). 11: v0.6 calendar events (ics.ts). 10: v0.5.1 JSON as line blocks, W-22 reader. 9: W-20 file kinds (scripts, CSV, calendars and contacts read as plain text; SVG; file flags)
 export const MAX_URL = 2048; // longer URLs are omitted (and counted), never shortened;
 // Points at Raibit's page on raibit.ai, which links to the GitHub repo once it is public; it stays (Travis,
 // SPEC section 9, 2026-11-01).

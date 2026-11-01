@@ -260,11 +260,12 @@ async function fetchRobots(origin: string): Promise<Robots> {
   const budget = callContext.getStore()?.renderBudget;
   const ROBOTS_COST = ROBOTS_MAX + WIRE_EXTRA; // what its connections may receive (safety.ts Wire), plus one read of slack
   if (budget && !budget.take(ROBOTS_COST)) throw new FetchError("The render's byte budget is spent.", "budget");
-  let charged = budget ? ROBOTS_COST : 0; // a failure is charged in full (bytes may have arrived)
+  let reserved = budget ? ROBOTS_COST : 0;
+  let charged = reserved; // a failure is charged in full (bytes may have arrived)
   const turns = new Turns(); // robots.txt holds its site's turn until read AND parsed, its delay noted (rounds 74, 86)
   try {
   try {
-    const res = await safeFetch(origin + "/robots.txt", {
+    const fetchRobots = () => safeFetch(origin + "/robots.txt", {
       maxBytes: ROBOTS_MAX,
       wireBytes: ROBOTS_COST - READ_SLACK,
       truncate: true,
@@ -285,6 +286,17 @@ async function fetchRobots(origin: string): Promise<Robots> {
         await turns.take(u, spacingMs() / 1000, signal); // v0.5.1: robots.txt waits its turn too (v0.6: and a site's own spacing, in the queue)
       },
     });
+    let res = await fetchRobots();
+    if (res.status === 304) {
+      turns.giveBack();
+      if (budget) {
+        budget.release(ROBOTS_COST, res.size ?? ROBOTS_COST);
+        reserved = charged = 0;
+        if (!budget.take(ROBOTS_COST)) throw new FetchError("The render's byte budget is spent.", "budget");
+        reserved = charged = ROBOTS_COST;
+      }
+      res = await fetchRobots();
+    }
     if (budget) charged = res.size ?? ROBOTS_COST; // what its connections received
     keep = !priv && !/(^|[\s,])no-store\b/i.test(res.headers.get("cache-control") ?? "");
     const finalOrigin = new URL(res.url).origin; // the site that actually answered
@@ -302,6 +314,8 @@ async function fetchRobots(origin: string): Promise<Robots> {
     if (w) robots = { mode: "wall", rules: [], crawlDelay: 0, sitemaps: [], wall: w, wallUrl: res.url, expires: Date.now() + 60_000 };
     // v0.9 hardening (Codex round 3b, HIGH): every success is a robots.txt to follow (RFC 9309 2.3.1.1), not
     // only a 200; a partial one (206) cannot be followed faithfully, so it means "the site says no".
+    else if (res.status === 304)
+      robots = closed("robots.txt returned an unexpected HTTP 304, so Tiresias assumes the site says no.", 60_000);
     else if (res.status === 206)
       robots = closed("robots.txt came back partial (HTTP 206), so Tiresias assumes the site says no.", 60_000);
     else if (res.status >= 200 && res.status < 300 && (res.bytes !== undefined || res.file !== undefined))
@@ -337,7 +351,7 @@ async function fetchRobots(origin: string): Promise<Robots> {
   }
   } finally {
     turns.giveBack();
-    if (budget) budget.release(ROBOTS_COST, charged);
+    if (budget && reserved) budget.release(reserved, charged);
   }
   // Cache-Control: no-store: keep it for this one call only, never across calls.
   if (keep) cache.set(origin, robots);

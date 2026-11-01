@@ -1367,3 +1367,22 @@ test("sweep review: a worksheet may repeat cols before its sheetData, as the for
   assert.ok(!o.flags.includes("office_unreadable"));
   assert.ok(JSON.stringify(o.sections).includes("kept"));
 });
+
+test("Office size fitting never returns text after dropping its receipts", async () => {
+  const home = freshHome();
+  const route = "/" + "p".repeat(1900);
+  const slides: [string, string][] = Array.from({ length: 60 }, (_, i) => ["<p:sld>", `Slide ${i + 1} evidence`]);
+  const s = await site({ [route]: { body: pptx(slides), name: "evidence.pptx" } });
+  const r = await engine.read(s.url + route, {}, ctx);
+  assert.equal(r.status, "file_warning");
+  const c = uc(r);
+  const sections = c.inside.sections ?? [];
+  assert.ok(!sections.length || c.receipts?.length, "returned Office text must retain its receipts");
+  for (const section of sections) assert.ok(c.receipts.some((receipt: any) => receipt.quote === section.text));
+  assert.ok(jsonBytes(r) <= 60_000);
+  if (!sections.length) {
+    assert.ok(c.dropped_for_size.includes("inside.sections"));
+    assert.equal(r.counts?.receipts, 0);
+    assert.doesNotMatch(logText(home, "receipts"), /"kind":"quote"/);
+  }
+});

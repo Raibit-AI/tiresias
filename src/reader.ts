@@ -82,6 +82,12 @@ function collapse(parts: (string | number)[]): Block {
   return { text, marks };
 }
 
+// Keep a UTF-16 boundary before an entire code point.
+function splitEnd(text: string, end: number): number {
+  const hi = text.charCodeAt(end - 1), lo = text.charCodeAt(end);
+  return hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff ? end - 1 : end;
+}
+
 // Split an overlong paragraph at spaces. Every piece is an exact substring.
 function splitBlock(b: Block): Block[] {
   if (b.text.length <= MAX_BLOCK) return [b];
@@ -93,6 +99,7 @@ function splitBlock(b: Block): Block[] {
       const sp = b.text.lastIndexOf(" ", end);
       if (sp > start + MAX_BLOCK / 2) end = sp;
     }
+    end = splitEnd(b.text, end);
     const lo = start;
     const marks = b.marks.filter(([pos]) => (pos > lo || lo === 0) && pos <= end).map(([pos, n]) => [pos - lo, n] as [number, number]);
     out.push({ text: b.text.slice(start, end), marks });
@@ -144,13 +151,13 @@ class Builder {
   // stays inside it (Codex round 81); the first chunk starts with `lead` (the item's marker) instead.
   pre(raw: string, marks: [number, number][] = [], lead = "", indent = "") {
     if (!this.cur) this.startTop();
-    for (let i = 0; i < raw.length; i += MAX_BLOCK) {
-      const piece = raw.slice(i, i + MAX_BLOCK);
+    for (let i = 0; i < raw.length; ) {
+      const end = splitEnd(raw, Math.min(i + MAX_BLOCK, raw.length));
+      const piece = raw.slice(i, end);
       // A fence longer than any run of backticks inside, so the text cannot close it (round 78).
       let run = 0;
       for (const m of piece.match(/`+/g) ?? []) run = Math.max(run, m.length);
       const fence = "`".repeat(Math.max(3, run + 1));
-      const end = i + piece.length;
       const head = i === 0 && lead ? lead : indent;
       const body = indent ? piece.split("\n").map((l) => indent + l).join("\n") : piece;
       const m = marks
@@ -162,6 +169,7 @@ class Builder {
         });
       this.cur!.blocks.push({ text: `${head}${fence}\n${body}\n${indent}${fence}`, marks: m });
       this.shield.scan(piece, "visible text");
+      i = end;
     }
   }
 
@@ -591,6 +599,7 @@ function chooseMain(root: N, b: Builder): void {
 
 interface Found {
   title?: N;
+  base?: N;
   ld: N[];
   links: N[];
   metas: N[];
@@ -608,6 +617,7 @@ function scanHead(root: N): Found {
     if (++count > MAX_NODES) throw new ComplexityError();
     if (n.name === "title" && !found.title) found.title = n;
     else if (n.name === "script" && /ld\+json/i.test(n.attribs?.type ?? "")) found.ld.push(n);
+    else if (n.name === "base" && !found.base && n.attribs?.href !== undefined) found.base = n;
     else if (n.name === "link") found.links.push(n);
     else if (n.name === "meta" && found.metas.length < 200) found.metas.push(n);
     else if (n.name === "html" && n.attribs?.lang && !found.lang) found.lang = n.attribs.lang;
@@ -679,9 +689,10 @@ export function lineBlocks(text: string): Block[] {
   for (let i = 0; i < text.length; ) {
     let j = text.indexOf("\n", i);
     if (j === -1) j = text.length;
-    for (let k = i; k < j; k += MAX_BLOCK) {
-      const e = Math.min(j, k + MAX_BLOCK);
+    for (let k = i; k < j; ) {
+      const e = splitEnd(text, Math.min(j, k + MAX_BLOCK));
       if (text.slice(k, e).trim()) lines.push([k, e]);
+      k = e;
     }
     i = j + 1;
   }
@@ -712,7 +723,11 @@ export function lineBlocks(text: string): Block[] {
 
 function rawBlocks(text: string): Block[] {
   const out: Block[] = [];
-  for (let i = 0; i < text.length; i += MAX_BLOCK) out.push({ text: text.slice(i, i + MAX_BLOCK), marks: [] });
+  for (let i = 0; i < text.length; ) {
+    const end = splitEnd(text, Math.min(i + MAX_BLOCK, text.length));
+    out.push({ text: text.slice(i, end), marks: [] });
+    i = end;
+  }
   return out;
 }
 
@@ -734,12 +749,19 @@ export function parseHtml(html: string, baseUrl: string, keep?: { forms?: FullFo
       if (why) shield.sheet.inherited.set(attrs, why);
     }
   }
-  const b = new Builder(shield, baseUrl);
+  const found = scanHead(doc);
+  let linkBase = baseUrl;
+  try {
+    const base = new URL(found.base?.attribs?.href ?? "", baseUrl);
+    if (base.protocol === "http:" || base.protocol === "https:") linkBase = base.href;
+  } catch {
+    // An unusable first base leaves links relative to the fetched page.
+  }
+  const b = new Builder(shield, linkBase);
   chooseMain(doc, b);
   walk(doc, b);
   b.flush();
 
-  const found = scanHead(doc);
   let title = found.title ? norm(rawText(found.title, MAX_TITLE * 2)).slice(0, MAX_TITLE) : "";
   if (!title) title = (b.sections.find((s) => s.level === 1)?.heading ?? "").slice(0, MAX_TITLE);
   shield.scan(title, "title");
@@ -747,7 +769,7 @@ export function parseHtml(html: string, baseUrl: string, keep?: { forms?: FullFo
   // Features of the page itself.
   const resolve = (h?: string) => {
     try {
-      return h ? new URL(h, baseUrl).href : null;
+      return h ? new URL(h, linkBase).href : null;
     } catch {
       return null;
     }
@@ -764,7 +786,7 @@ export function parseHtml(html: string, baseUrl: string, keep?: { forms?: FullFo
   }
 
   const page = finish(b, { title, feeds, service_desc });
-  page.meta = pageMeta(found, baseUrl);
+  page.meta = pageMeta(found, linkBase);
   for (const v of [page.meta?.byline, page.meta?.description, page.meta?.og?.title, page.meta?.og?.description]) if (v) shield.scan(v, "page metadata");
 
   // Structured data (JSON-LD) becomes its own numbered section, so it can be
@@ -881,7 +903,8 @@ export function parseSvg(body: string, baseUrl: string): ParsedPage {
 export type PlainMode = "script" | "csv" | "calendar" | "contact";
 const PLAIN_HEADING: Record<PlainMode, string> = { script: "(script)", csv: "(CSV)", calendar: "(calendar)", contact: "(contact)" };
 export function parsePlain(text: string, baseUrl: string, mode: PlainMode): ParsedPage {
-  if (text.length > MAX_EXPANDED) text = text.slice(0, MAX_EXPANDED);
+  const omitted = text.length > MAX_EXPANDED ? text.length - splitEnd(text, MAX_EXPANDED) : 0;
+  if (omitted) text = text.slice(0, text.length - omitted);
   // Calendar and contact lines may be folded (a line break followed by a space or tab continues the line).
   if (mode === "calendar" || mode === "contact") text = text.replace(/\r?\n[ \t]/g, "");
   const shield = new Shield();
@@ -890,7 +913,7 @@ export function parsePlain(text: string, baseUrl: string, mode: PlainMode): Pars
   for (const x of blocks) shield.scan(x.text, "text");
   b.sections.push({ n: 1, level: 0, heading: PLAIN_HEADING[mode], generated: true, blocks });
   if (mode === "calendar" || mode === "contact") for (const u of bareUrls(text)) b.link(u, u);
-  const page = finish(b, {});
+  const page = finish(b, { text_omitted: omitted || undefined });
   if (mode === "calendar") calendarEvents(text, page, shield); // v0.6: the invite's events, structured (ics.ts)
   const own: Flag[] = [];
   if (mode === "csv") {
@@ -1222,8 +1245,9 @@ export function parseJsonText(text: string, baseUrl: string): ParsedPage {
   }
   if (pretty.length > MAX_EXPANDED) {
     // raw text that is not JSON: keep the first MAX_EXPANDED characters and count the rest
-    omitted = pretty.length - MAX_EXPANDED;
-    pretty = pretty.slice(0, MAX_EXPANDED);
+    const end = splitEnd(pretty, MAX_EXPANDED);
+    omitted = pretty.length - end;
+    pretty = pretty.slice(0, end);
   }
   const shield = new Shield();
   shield.scan(pretty, "JSON body");
@@ -1280,8 +1304,9 @@ function pdfBlocks(text: string): Block[] {
     let l = line;
     while (l.length > MAX_BLOCK) {
       flush();
-      out.push({ text: l.slice(0, MAX_BLOCK), marks: [] });
-      l = l.slice(MAX_BLOCK);
+      const end = splitEnd(l, MAX_BLOCK);
+      out.push({ text: l.slice(0, end), marks: [] });
+      l = l.slice(end);
     }
     if (cur && cur.length + 1 + l.length > MAX_BLOCK) flush();
     cur = cur ? cur + "\n" + l : l;

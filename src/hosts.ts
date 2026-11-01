@@ -60,8 +60,8 @@ function readNext(file: string, spacing: number): number {
 
 // Reserve the next slot for `origin` with `spacing` ms between starts and return when it begins (epoch
 // ms). `earliest` is this process's own earliest time. Store trouble never fails a request: the slot is
-// then this process's own.
-export function reserve(origin: string, spacing: number, earliest: number): number {
+// then this process's own. `whenReady` leaves a future slot unclaimed so a cancelled wait moves nothing.
+export function reserve(origin: string, spacing: number, earliest: number, whenReady = false): number {
   const now = Date.now();
   let dir: string | null;
   try {
@@ -86,6 +86,7 @@ export function reserve(origin: string, spacing: number, earliest: number): numb
   if (!held) return Math.max(now, earliest, readNext(file, spacing)) + spacing;
   try {
     const slot = Math.max(now, earliest, readNext(file, spacing));
+    if (whenReady && slot > now) return slot;
     const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
     try {
       const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW, 0o600);

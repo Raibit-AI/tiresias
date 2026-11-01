@@ -2,7 +2,7 @@
 // W-06: handoff tickets and resume, including a page a person provided.
 // (Split out of engine.ts in v0.5.1, behavior unchanged.)
 import path from "node:path";
-import { ConfigError, loadLimits } from "./config.js";
+import { ConfigError, DEFAULT_LIMITS, readConfigObject } from "./config.js";
 import { classify } from "./files.js";
 import * as handoffs from "./handoffs.js";
 import { decode, fetchCap, throwIfCancelled } from "./safety.js";
@@ -96,7 +96,12 @@ export async function fromPerson(t: handoffs.Ticket, p: Provided, opts: Opts, me
   return out;
 }
 
-export const keepDays = () => loadLimits().keep_handoff_days;
+export const keepDays = () => {
+  const value = readConfigObject()?.keep_handoff_days;
+  if (value === undefined) return DEFAULT_LIMITS.keep_handoff_days;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) throw new ConfigError('config.json: "keep_handoff_days" must be a whole number of 1 or more.');
+  return value;
+};
 
 // W-06: pick up a read that stopped at a wall. Without `provided`, the original read runs again
 // (same URL, question, section, render and translate options) with every rule in force: robots.txt, waits, signing and wall

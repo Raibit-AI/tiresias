@@ -15,6 +15,7 @@
 import { callContext } from "./context.js";
 import { probeOrigin } from "./doors.js";
 import * as safebrowsing from "./safebrowsing.js";
+import { snapshotConfig } from "./config.js";
 import { withSignal } from "./safety.js";
 import { canonOrigin } from "./sitekey.js";
 import { MAX_SPACING_S, loadSites } from "./sites.js";
@@ -47,18 +48,20 @@ export function startDoorProbe(origin: string): boolean {
   if (jobs.has(key)) return true;
   if (jobs.size >= MAX_JOBS) return false;
   let gate: safebrowsing.CallSafety;
+  let config: ReturnType<typeof snapshotConfig>;
   try {
-    gate = safebrowsing.makeGate({ allowFlagged: false, priv: false });
+    config = snapshotConfig();
+    gate = callContext.run({ config }, () => safebrowsing.makeGate({ allowFlagged: false, priv: false }));
   } catch {
     return false;
   }
   const ctl = new AbortController();
   const signal = AbortSignal.any([AbortSignal.timeout(JOB_MS), ctl.signal, shutdownSignal]);
   const sent = { requests: 0, signed: 0 };
-  // Outside the asking call's context (callContext.exit): not its deadline, its cancellation, its
+  // Outside the asking call's context: not its deadline, its cancellation, its
   // per-call robots cache or its private flag; withSignal then gives the job a context of its own.
   const done = callContext
-    .exit(() =>
+    .run({ config }, () =>
       withSignal(signal, () => {
         // A job is its own call: it reads the site settings once, when it starts (sites.ts).
         const store = callContext.getStore();

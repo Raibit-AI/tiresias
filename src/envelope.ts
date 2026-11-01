@@ -2,6 +2,7 @@
 // Reply building: the envelope, its budget, the error map, the handoff ticket for a wall, and guarded(),
 // the wrapper every tool call runs in (deadline, Safe Browsing, private mode, history).
 // (Split out of engine.ts in v0.5.1, behavior unchanged.)
+import { snapshotConfig } from "./config.js";
 import { type FileKind } from "./files.js";
 import * as scanner from "./scanner.js";
 import { FetchError, Flagged, PaymentRequired, Refused, SafetyError, TiresiasError, Walled } from "./errors.js";
@@ -260,7 +261,18 @@ export function errorEnv(url: string, e: unknown): Envelope {
   }
 }
 
-export async function guarded(
+export async function guarded(...args: Parameters<typeof guardedCall>): Promise<Envelope> {
+  let config: ReturnType<typeof snapshotConfig> | undefined;
+  let configError: unknown;
+  try {
+    config = snapshotConfig();
+  } catch (e) {
+    configError = e;
+  }
+  return callContext.run({ ...callContext.getStore(), config, configError }, () => guardedCall(...args));
+}
+
+async function guardedCall(
   tool: Tool, url: string, ctx: Ctx, purpose: string | undefined, fn: (meta: CallMeta) => Promise<Envelope>, meta: CallMeta = {}, hand?: Hand,
   safetyCheck = true, // W-19: false only for a page a person provided (nothing is requested)
   record = true, // W-04: false for form_preview, which writes nothing (no trim, no history line)
@@ -278,6 +290,7 @@ export async function guarded(
   try {
     // W-19: the asked URL is checked first, before robots.txt or anything else, and before a copy is
     // served from the cache. Every later hop on a new host is checked by the fetcher (safety.ts).
+    if (callContext.getStore()?.configError) throw callContext.getStore()!.configError;
     assertProfile(); // W-18: a profile that does not exist fails here, by name, before anything else
     gate = safetyCheck ? safebrowsing.makeGate({ allowFlagged: !!ctx.allow_flagged, priv, readOnly: !record }) : undefined;
     const g = gate;
@@ -316,7 +329,7 @@ export async function guarded(
   if (!record) return out;
   try {
     history.record({
-      time: new Date().toISOString(), tool, url, agent: ctx.agent, purpose: purpose?.slice(0, 500), status: out.status, door: out.door,
+      time: new Date().toISOString(), tool, url, agent: ctx.agent, purpose, status: out.status, door: out.door,
       reason: out.handoff?.reason, matched: meta.matched, best_door: meta.best_door, llms_txt: meta.llms_txt,
       ticket: meta.ticket, source: meta.source, cache: meta.cache, flag: meta.flag, slip: meta.slip, file_kind: meta.file_kind, scan: meta.scan,
       lang: out.language?.code, // W-26 (v0.7)

@@ -385,7 +385,10 @@ export function inspectScript(mark: string): string {
     // Judge that control, and mark the element so its raw-text serialization keeps the mark.
     const all = tag(el) === 'TEXTAREA' ? [rect(el)] : range.getClientRects();
     const rects = [];
-    for (let k = 0; k < all.length && rects.length < 50; k++) if (all[k].width >= 2 && all[k].height >= 2) rects.push(all[k]);
+    for (let k = 0; k < all.length; k++) {
+      if (timeUp()) { out.complete = false; return 'unmeasured'; }
+      if (all[k].width >= 2 && all[k].height >= 2) rects.push(all[k]);
+    }
     if (!rects.length) return 'zero_size';
     const sx = window.scrollX, sy = window.scrollY;
     const page = rects.map((r) => ({ l: r.left + sx, t: r.top + sy, r: r.right + sx, b: r.bottom + sy }));

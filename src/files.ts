@@ -60,7 +60,7 @@ export const FLAG_TEXT = {
 // agree (a .js page served as text/html is text either way).
 type Family = "text" | "pdf" | "image" | "media" | "archive" | "program" | "ole" | "shortcut";
 
-type Sig = { family: Family; kind: FileKind | "pdf" | "script" };
+type Sig = { family: Family; kind: FileKind | "pdf" | "script"; zip?: true };
 
 const at = (b: Buffer, off: number, bytes: number[] | string): boolean => {
   const want = typeof bytes === "string" ? Buffer.from(bytes, "latin1") : Buffer.from(bytes);
@@ -85,7 +85,7 @@ export function signature(b: Buffer, tail?: Buffer): Sig | null {
   if (at(b, 0, [0x4c, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00])) return { family: "shortcut", kind: "shortcut" }; // Windows .lnk
   if (at(b, 0, "Cr24")) return { family: "archive", kind: "addon" }; // Chrome extension
   // Archives and disk images
-  if (at(b, 0, "PK\x03\x04") || at(b, 0, "PK\x05\x06") || at(b, 0, "PK\x07\x08")) return { family: "archive", kind: "archive" }; // zip and its family
+  if (at(b, 0, "PK\x03\x04") || at(b, 0, "PK\x05\x06") || at(b, 0, "PK\x07\x08")) return { family: "archive", kind: "archive", zip: true }; // zip and its family
   if (at(b, 0, "Rar!\x1a\x07")) return { family: "archive", kind: "archive" };
   if (at(b, 0, [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])) return { family: "archive", kind: "archive" }; // 7z
   if (at(b, 0, [0x1f, 0x8b])) return { family: "archive", kind: "archive" }; // gzip
@@ -314,10 +314,10 @@ function doubleExtension(name: string | undefined): boolean {
 
 // A zip, OLE or Chrome add-on is one family with several kinds. The kind inside the family is taken from
 // what the response says it is, since nothing inside the file is read.
-function refine(kind: FileKind, sigFamily: Family, ct: string, names: Names): FileKind {
+function refine(kind: FileKind, sigFamily: Family, ct: string, names: Names, zip = false): FileKind {
   const exts = [names.disposition, ...(names.others ?? []), names.url].map(lastExt).filter((x): x is string => !!x);
   if (sigFamily === "ole") return exts.includes("msi") || ct === "application/x-msi" ? "program" : "office";
-  if (kind !== "archive" || sigFamily !== "archive") return kind;
+  if (kind !== "archive" || !zip) return kind;
   if (exts.some((e) => ADDON_EXT.has(e)) || ct === "application/x-xpinstall" || ct === "application/x-chrome-extension") return "addon";
   if (exts.some((e) => ZIP_PROGRAM_EXT.has(e)) || ["application/java-archive", "application/x-java-archive", "application/vnd.android.package-archive", "application/vnd.ms-appx", "application/msix"].includes(ct)) return "program";
   if (exts.some((e) => OFFICE_EXT.has(e)) || /^application\/vnd\.(openxmlformats-officedocument|ms-[a-z]+\.[a-z.]*macroenabled|oasis\.opendocument)/.test(ct)) return "office";
@@ -387,7 +387,7 @@ function decide(head: Buffer, m: string, names: Names, sig: Sig | null): Verdict
     if (typeFamily(m) === "text") return { read: m.includes("html") ? "html" : "text", flags: [] };
     return { file: "unknown", flags: [] };
   }
-  if (sig && sig.kind !== "script") return { file: refine(sig.kind as FileKind, sig.family, m, names), flags: [] };
+  if (sig && sig.kind !== "script") return { file: refine(sig.kind as FileKind, sig.family, m, names, sig.zip), flags: [] };
   if (!sig && m === "application/pdf") return { read: "pdf", flags: [] }; // W-17: the declared type alone (a broken PDF fails to read)
   if (looksBinary(head)) return { file: "unknown", flags: [] };
   // Every text rule that applies is collected (from the content, the declared type and both names) and the

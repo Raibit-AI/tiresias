@@ -16,6 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomBytes, sign as edSign, verify as edVerify } from "node:crypto";
 import { ensureSlipKey, readSlipKey } from "./keys.js";
+import { releaseLock, stillOwned, takeLock } from "./savedlock.js";
 import { bound as boundReceipt } from "./receipts.js";
 import { DEFAULT_LIMITS, loadLimits, loadSavingMode, type Limits } from "./config.js";
 import { NOFOLLOW, NONBLOCK, checkSub, rmRegular, isPrivate, ownFile, profileName, readBounded, readHome, sha256, subDir, PRIVATE_WRITE, PrivateWriteError } from "./store.js";
@@ -311,46 +312,56 @@ export function saveSnapshot(input: SaveInput, receipts: Receipt[], limits?: Lim
   if (manifestBytes.length > MAX_MANIFEST) return { status: "failed", reason: "store" };
   // Everything this snapshot will take on disk, the manifest included (Codex v0.8 round 1).
   const newBytes = parts.reduce((n, p) => n + p.data.length, 0);
-  let d: string;
-  let dirId: Ident;
+  // Capacity and publication share one lock with cleanup; only a dead owner's lock can be recovered.
+  let held: { file: string; token: string } | undefined;
   try {
-    const lim = limits ?? loadLimits();
-    d = savedDir(true)!;
-    dirId = identOf(d);
-    const { snaps, tmps, complete } = entries(d);
-    if (!complete) return { status: "failed", reason: "store" }; // the caps cannot be checked: fail closed
-    // Temp folders take disk too (another save in progress, or one left behind): they count (Codex v0.8 round 3).
-    const used = [...snaps, ...tmps].reduce((n, e) => n + e.bytes, 0);
-    // A save never evicts: a prompt-injected agent saving again and again must not push out older evidence.
-    if (snaps.length >= MAX_SNAPSHOTS || used + newBytes + manifestBytes.length > (lim.max_saved_mb ?? DEFAULT_LIMITS.max_saved_mb) * 1024 * 1024) return { status: "over_cap" };
-  } catch (e) {
-    if (e instanceof PrivateWriteError) return { status: "private" };
-    return { status: "failed", reason: "store" };
-  }
-  const tmpName = `.tmp-${randomBytes(8).toString("hex")}`;
-  const tmp = path.join(d, tmpName);
-  let made = false;
-  try {
-    sameDir(d, dirId);
-    fs.mkdirSync(tmp, { mode: 0o700 });
-    made = true;
-    const tmpId = identOf(tmp);
-    for (const p of parts) {
-      sameDir(d, dirId), sameDir(tmp, tmpId);
-      writeNew(path.join(tmp, p.name), p.data);
+    let d: string;
+    let dirId: Ident;
+    try {
+      const lim = limits ?? loadLimits();
+      d = savedDir(true)!;
+      dirId = identOf(d);
+      const token = takeLock(d);
+      if (!token) return { status: "failed", reason: "store" };
+      held = { file: d, token };
+      const { snaps, tmps, complete } = entries(d);
+      if (!complete) return { status: "failed", reason: "store" }; // the caps cannot be checked: fail closed
+      // Temp folders take disk too (another save in progress, or one left behind): they count (Codex v0.8 round 3).
+      const used = [...snaps, ...tmps].reduce((n, e) => n + e.bytes, 0);
+      // A save never evicts: a prompt-injected agent saving again and again must not push out older evidence.
+      if (snaps.length >= MAX_SNAPSHOTS || used + newBytes + manifestBytes.length > (lim.max_saved_mb ?? DEFAULT_LIMITS.max_saved_mb) * 1024 * 1024) return { status: "over_cap" };
+    } catch (e) {
+      if (e instanceof PrivateWriteError) return { status: "private" };
+      return { status: "failed", reason: "store" };
     }
-    sameDir(d, dirId), sameDir(tmp, tmpId);
-    writeNew(path.join(tmp, "manifest.json"), manifestBytes);
-    sameDir(d, dirId), sameDir(tmp, tmpId);
-    fs.renameSync(tmp, path.join(d, id)); // one step: a reader never sees half a snapshot
-    made = false;
-    sameDir(path.join(d, id), tmpId); // the folder now named by the id is the one just written
-  } catch {
-    if (made) removeDir(tmp, true);
-    return { status: "failed", reason: "store" };
+    const tmpName = `.tmp-${randomBytes(8).toString("hex")}`;
+    const tmp = path.join(d, tmpName);
+    let made = false;
+    try {
+      sameDir(d, dirId);
+      fs.mkdirSync(tmp, { mode: 0o700 });
+      made = true;
+      const tmpId = identOf(tmp);
+      for (const p of parts) {
+        sameDir(d, dirId), sameDir(tmp, tmpId);
+        writeNew(path.join(tmp, p.name), p.data);
+      }
+      sameDir(d, dirId), sameDir(tmp, tmpId);
+      writeNew(path.join(tmp, "manifest.json"), manifestBytes);
+      sameDir(d, dirId), sameDir(tmp, tmpId);
+      if (!stillOwned(d, held!.token)) throw new SavedError("The snapshot lock changed.");
+      fs.renameSync(tmp, path.join(d, id)); // one step: a reader never sees half a snapshot
+      made = false;
+      sameDir(path.join(d, id), tmpId); // the folder now named by the id is the one just written
+    } catch {
+      if (made) removeDir(tmp, true);
+      return { status: "failed", reason: "store" };
+    }
+    for (const r of receipts.slice(0, MAX_RECEIPTS)) r.snapshot = id;
+    return { status: "saved", id, files: parts.length, bytes: newBytes, ...(input.rendered ? { rendered: true as const } : {}), ...(input.file && !parts.length ? { fingerprint_only: true as const } : {}) };
+  } finally {
+    if (held) releaseLock(held.file, held.token);
   }
-  for (const r of receipts.slice(0, MAX_RECEIPTS)) r.snapshot = id;
-  return { status: "saved", id, files: parts.length, bytes: newBytes, ...(input.rendered ? { rendered: true as const } : {}), ...(input.file && !parts.length ? { fingerprint_only: true as const } : {}) };
 }
 
 // ---- reading back ----
@@ -680,14 +691,26 @@ export function planCleanup(now: number, limits: Limits): SavedCleanup {
 }
 export function applyCleanup(plan: SavedCleanup): { removed: number; kept: number; bytes_freed: number } {
   const result = { removed: 0, kept: plan.kept, bytes_freed: 0 };
-  for (const r of plan.remove) {
-    try {
-      removeDir(r.dir);
-      result.removed++;
-      result.bytes_freed += r.bytes;
-    } catch {
-      result.kept++; // left for the next run
+  if (!plan.remove.length) return result;
+  let held: { file: string; token: string } | undefined;
+  try {
+    const d = savedDir(false);
+    if (!d || isPrivate()) return { ...result, kept: result.kept + plan.remove.length };
+    const token = takeLock(d);
+    if (!token) return { ...result, kept: result.kept + plan.remove.length };
+    held = { file: d, token };
+    for (const r of plan.remove) {
+      try {
+        if (!stillOwned(d, token)) throw new SavedError("The snapshot lock changed.");
+        removeDir(r.dir);
+        result.removed++;
+        result.bytes_freed += r.bytes;
+      } catch {
+        result.kept++; // left for the next run
+      }
     }
+    return result;
+  } finally {
+    if (held) releaseLock(held.file, held.token);
   }
-  return result;
 }

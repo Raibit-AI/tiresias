@@ -128,7 +128,7 @@ test("a changed-since check works on PDFs, and the cache stores the parsed pages
   await engine.read(s.url + "/g.pdf", {}, { agent: "a" });
   const again = await engine.read(s.url + "/g.pdf", {}, { agent: "a" });
   assert.equal(again.status, "unchanged");
-  assert.equal(PARSER_VERSION, 14); // 14 since v0.9.1 (the sweep's reader fixes); 13 since v0.9 (generated labels); 12 since v0.7 (language, W-26); 11 since v0.6 (calendar events); 10 since v0.5.1 (JSON line blocks, the W-22 reader)
+  assert.equal(JSON.parse(fs.readFileSync(store.cachePath(s.url + "/g.pdf"), "utf8")).parser, PARSER_VERSION);
 });
 
 test("a damaged file is a clear error, nothing crashes, and the next read works", async () => {

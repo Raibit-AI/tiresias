@@ -21,6 +21,13 @@ import { appendLine, cachePath, readJson, readLogSync, rootDir } from "./store.j
 const ABSURD_SECONDS = 10 * 365 * 86_400;
 export const ABSURD_FALLBACK_SECONDS = 86_400;
 
+// The three HTTP-date spellings, excluding Date.parse's permissive numeric and ISO inputs.
+const WEEKDAY = "(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)";
+const MONTH = "(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)";
+const CLOCK = "[0-2][0-9]:[0-5][0-9]:[0-5][0-9]";
+const HTTP_DATE = new RegExp(`^(?:${WEEKDAY}, [0-3][0-9] ${MONTH} [0-9]{4} ${CLOCK} GMT|(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), [0-3][0-9]-${MONTH}-[0-9]{2} ${CLOCK} GMT|${WEEKDAY} ${MONTH} (?: [1-9]|[0-3][0-9]) ${CLOCK} [0-9]{4})$`);
+const httpDate = (s: string): number => HTTP_DATE.test(s) ? Date.parse(s) : NaN;
+
 // Retry-After is either whole seconds or an HTTP date. Returns null when it
 // is missing, unreadable or absurd.
 export function parseRetryAfter(v: string | null | undefined): number | null {
@@ -29,7 +36,7 @@ export function parseRetryAfter(v: string | null | undefined): number | null {
   let secs: number;
   if (/^\d+$/.test(t)) secs = Number(t);
   else {
-    const when = Date.parse(t);
+    const when = httpDate(t);
     if (Number.isNaN(when)) return null;
     secs = Math.max(0, Math.ceil((when - Date.now()) / 1000));
   }
@@ -42,7 +49,7 @@ export function cooldownSeconds(status: number, header: string | null | undefine
   if (parsed !== null) return parsed;
   if (header && header.trim()) {
     const t = header.trim();
-    const absurd = /^\d+$/.test(t) || !Number.isNaN(Date.parse(t));
+    const absurd = /^\d+$/.test(t) || !Number.isNaN(httpDate(t));
     if (absurd) return ABSURD_FALLBACK_SECONDS;
   }
   return status === 429 ? 60 : 30; // no usable header: a polite default

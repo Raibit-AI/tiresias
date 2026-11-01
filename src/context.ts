@@ -4,6 +4,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
 export interface CallContext {
+  // All setting readers share the raw file, effective values and confirmations from the call's start.
+  configError?: unknown;
+  config?: { raw: Record<string, unknown> | null; effective: Record<string, unknown> | null; record: { rec: import("./confirm.js").Rec; state: import("./confirm.js").RecordState } };
   signal?: AbortSignal; // MCP cancellation plus the call's overall deadline
   private?: boolean; // W-14: the call keeps nothing (store writes refuse; see store.ts)
   robots?: Map<string, unknown>; // robots.txt kept for this call only, when the site said no-store

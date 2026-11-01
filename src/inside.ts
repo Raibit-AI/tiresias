@@ -248,8 +248,8 @@ export function fitInside(e: Envelope, hardLimit: number): void {
   uc.dropped_for_size = dropped;
   const steps: [Record<string, unknown> | undefined, string, string][] = [
     [ins, "entries", "inside.entries"], [ins, "skipped_parts", "inside.skipped_parts"], [ins, "embedded", "inside.embedded"], [ins, "external_links", "inside.external_links"],
-    [uc, "receipts", "receipts"], [ins, "sections", "inside.sections"], [ins, "section", "inside.section"],
-    [ins, "passages", "inside.passages"], [ins, "outline", "inside.outline"], [uc, "flag_details", "flag_details"], [ins, "note", "inside.note"],
+    [ins, "sections", "inside.sections"], [ins, "section", "inside.section"],
+    [ins, "passages", "inside.passages"], [ins, "outline", "inside.outline"], [uc, "receipts", "receipts"], [uc, "flag_details", "flag_details"], [ins, "note", "inside.note"],
   ];
   for (const [obj, key, label] of steps) {
     if (jsonBytes(e) <= hardLimit) break;

@@ -6,7 +6,8 @@ import path from "node:path";
 import { releaseLock, stillOwned, takeLock } from "./ownedlock.js";
 import { NOFOLLOW, NONBLOCK, home, ownFile, randomTmp, readOwnedText } from "./store.js";
 // W-32 (v0.9): readers of a risky setting use the value in force (an unconfirmed loosening is held back).
-import { inForceConfig } from "./confirm.js";
+import { clamp, inForceConfig, loadRecord } from "./confirm.js";
+import { callContext, type CallContext } from "./context.js";
 
 export interface Limits {
   keep_history_days: number;
@@ -87,7 +88,7 @@ export function loadTranslator(): TranslatorConfig | null {
 }
 
 // The whole config.json as an object (null when there is none). A bad file is a ConfigError.
-export function readConfigObject(): Record<string, unknown> | null {
+function readConfigFile(): Record<string, unknown> | null {
   const raw = readOwnedText("config.json");
   if (raw === null) return null;
   let obj: unknown;
@@ -98,6 +99,17 @@ export function readConfigObject(): Record<string, unknown> | null {
   }
   if (typeof obj !== "object" || obj === null || Array.isArray(obj)) throw new ConfigError("config.json must be a JSON object.");
   return obj as Record<string, unknown>;
+}
+
+export function readConfigObject(): Record<string, unknown> | null {
+  const snapshot = callContext.getStore()?.config;
+  return snapshot ? snapshot.raw : readConfigFile();
+}
+
+export function snapshotConfig(): NonNullable<CallContext["config"]> {
+  const raw = readConfigFile();
+  const record = callContext.exit(() => loadRecord());
+  return { raw, effective: clamp(raw, record.rec).obj, record };
 }
 
 // W-21: the scanner hook of this profile, or null when none is set. A bad setting is a ConfigError.
@@ -157,30 +169,15 @@ export function parseAgentStyle(v: unknown): AgentStyle {
 // stops a read. Returns null when signing is not configured. A config file that exists
 // but cannot be read at all is an error (the caller decides whether that matters).
 export function loadSigningConfig(): { signature_agent: string; style: AgentStyle } | null {
-  const raw = readOwnedText("config.json");
-  if (raw === null) return null;
-  let obj: unknown;
-  try {
-    obj = JSON.parse(raw);
-  } catch {
-    throw new ConfigError("config.json in the Tiresias folder is not valid JSON.");
-  }
-  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) throw new ConfigError("config.json must be a JSON object.");
-  const o = obj as Record<string, unknown>;
+  const o = readConfigObject();
+  if (o === null) return null;
   if (!Object.hasOwn(o, "signature_agent")) return null;
   return { signature_agent: parseSignatureAgent(o.signature_agent), style: Object.hasOwn(o, "signature_agent_style") ? parseAgentStyle(o.signature_agent_style) : "quoted" };
 }
 
 export function loadLimits(): Limits {
-  const raw = readOwnedText("config.json");
-  if (raw === null) return { ...DEFAULT_LIMITS };
-  let obj: unknown;
-  try {
-    obj = JSON.parse(raw);
-  } catch {
-    throw new ConfigError("config.json in the Tiresias folder is not valid JSON. Fix it or delete it to use the defaults.");
-  }
-  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) throw new ConfigError("config.json must be a JSON object, like {\"keep_history_days\": 90}.");
+  const obj = readConfigObject();
+  if (obj === null) return { ...DEFAULT_LIMITS };
   const out: Limits = { ...DEFAULT_LIMITS };
   // Own properties only: "constructor", "toString" and "__proto__" are not settings.
   // (JSON.parse makes "__proto__" an ordinary own key, so entries() lists it and it is rejected.)

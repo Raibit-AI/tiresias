@@ -12,12 +12,13 @@
 // Nothing reachable over MCP reads or changes a setting or a confirmation; MCP replies only carry the notice.
 import fs from "node:fs";
 import path from "node:path";
+import { callContext } from "./context.js";
 import { DEFAULT_CALENDARS, parseAnchoring, parseCalendars, parseSafeBrowsing, parseSaving, parseScanner, parseTranslator, readConfigObject, writeConfig } from "./config.js";
 import { parseRender } from "./render.js";
 import { ConfigError } from "./errors.js";
 import * as history from "./history.js";
-import { candidates, DEFAULT_PORTS, MIN_SPACING_S, normalizeSite, parsePortList, parseSiteRule, parseSites } from "./sites.js";
-import { NOFOLLOW, NONBLOCK, home, ownFile, randomTmp, readOwnedText } from "./store.js";
+import { candidates, DEFAULT_PORTS, MAX_CONFIRMED_SITES, MIN_SPACING_S, normalizeSite, parsePortList, parseSiteRule, parseSites } from "./sites.js";
+import { NOFOLLOW, NONBLOCK, home, homeDir, ownFile, randomTmp, readOwnedText } from "./store.js";
 
 export const RECORD = "confirmations.json";
 export const NEVER_ASK = "YES, NEVER ASK AGAIN FOR RISKY SETTINGS";
@@ -192,6 +193,8 @@ function parseRecord(raw: string): Rec | null {
 
 // The record and how it was found. Missing or damaged: the defaults, asking on (fail closed).
 export function loadRecord(): { rec: Rec; state: RecordState } {
+  const snapshot = callContext.getStore()?.config?.record;
+  if (snapshot) return snapshot;
   let raw: string | null;
   try {
     raw = readOwnedText(RECORD, RECORD_MAX);
@@ -244,7 +247,7 @@ const sitesOf = (o: Record<string, unknown> | null | undefined): Record<string, 
 // The record's own confirmed sites: each entry as the readers accept it, without the 500-site cap of config.json
 // (the record can also hold confirmed entries config.json no longer has), at most 5,000.
 const recordSitesValid = (v: unknown): boolean => {
-  if (!isObj(v) || Object.keys(v).length > 5000) return false;
+  if (!isObj(v) || Object.keys(v).length > MAX_CONFIRMED_SITES) return false;
   try {
     for (const [k, r] of Object.entries(v)) {
       normalizeSite(k);
@@ -334,7 +337,8 @@ function confirmedSites(rec: Rec): Sites {
 
 // The config.json object every reader of a setting uses (null when there is none). A bad file is a ConfigError.
 export function inForceConfig(): Record<string, unknown> | null {
-  return clamp(readConfigObject(), loadRecord().rec).obj;
+  const snapshot = callContext.getStore()?.config;
+  return snapshot ? snapshot.effective : clamp(readConfigObject(), loadRecord().rec).obj;
 }
 export const asking = (): boolean => loadRecord().rec.ask;
 
@@ -644,7 +648,7 @@ export function stateForView(raw: Record<string, unknown> | null): { asking: boo
   const { rec, state } = loadRecord();
   let file = RECORD;
   try {
-    file = path.join(home(), RECORD);
+    file = path.join(homeDir(), RECORD);
   } catch {
     // no profile folder yet
   }

@@ -106,9 +106,15 @@ export function pickSource(u: URL, od: OriginDoors | null): { source: string; de
     // built from that name too (Codex round 6).
     const cu = new URL(u.href);
     cu.hostname = hostKey(cu.hostname);
-    const base = cu.href.split("#")[0];
+    cu.hash = "";
+    const base = cu.pathname;
     const stripped = base.replace(/\/$/, "");
-    const candidates = [base + ".md", stripped + ".md", base.endsWith("/") ? base + "index.html.md" : ""];
+    const candidates = [base + ".md", stripped + ".md", base.endsWith("/") ? base + "index.html.md" : ""].map((p) => {
+      if (!p) return "";
+      const twin = new URL(cu.href);
+      twin.pathname = p;
+      return twin.href;
+    });
     const hit = candidates.find((c) => c && od.llms_md!.includes(c));
     if (hit) return { source: hit, detail: "markdown" };
   }
@@ -285,7 +291,8 @@ export async function run(tool: Tool, rawUrl: string, opts: Opts, meta: CallMeta
   const renderMode: RenderMode = tool === "read" || tool === "check" ? loadRenderMode() : "off";
   // Explicit renders and checks of rendered copies need a body and a new browser run, even after a 304.
   // The one shortcut is an already rendered copy still fresh under the site's cache rules (below).
-  const rerender = renderMode !== "off" && (!!opts.render || (tool === "check" && !!cache?.rendered));
+  const rerender = renderMode !== "off" && (!!opts.render || (tool === "check" && !!cache?.rendered) || (renderMode === "auto" && !!cache?.shell && !cache.rendered));
+  const needsBody = rerender || (renderMode === "off" && !!cache?.rendered);
   // W-28 (v0.8): a read that asks to save, when the owner allows it (a bad setting fails the read, by name). A save
   // keeps what THIS read received, so it never uses a fresh copy, a 304 or a cached rendering: it always fetches.
   const sv: SaveCtx | undefined = tool === "read" && opts.save && savePolicy() === "ask" ? {} : undefined;
@@ -294,14 +301,14 @@ export async function run(tool: Tool, rawUrl: string, opts: Opts, meta: CallMeta
   // Only a copy whose fetch had no redirect at all (recorded by the fetch itself; a missing field
   // means no) and that was read from the page itself, not llms.txt or a twin: the rules just
   // checked are then the rules of the page being served (Codex rounds 38 and 39).
-  if (cache && !staleParse && (!rerender || cache.rendered) && !sv && !opts.fresh && cache.redirected === false && cache.source_url === url && isFresh(cache)) {
+  if (cache && !staleParse && (!needsBody || (renderMode !== "off" && cache.rendered)) && !sv && !opts.fresh && cache.redirected === false && cache.source_url === url && isFresh(cache)) {
     meta.cache = "fresh";
     const od = tool === "read" ? cachedDoors(u.origin) : null;
     if (od) noteDoors(meta, summarize(od));
     // W-30 (Codex round 1): a copy served from the cache with no door answers starts (or reports) the
     // background checks too, so a cancelled or refused job is retried and a running one is reported.
     const later = tool === "read" && !od && !priv && doorsMode === "background";
-    const out = await finishPage(tool, url, cache, true, null, opts, later ? pageOnly(u.origin) : od, new Date().toISOString(), () => {}, meta, { fresh: false }, false, { cache: "fresh", agent });
+    const out = await finishPage(tool, url, cache, true, null, opts, later ? pageOnly(u.origin) : od, new Date().toISOString(), () => {}, meta, { fresh: false }, false, { cache: "fresh", agent, ...(opts.render && renderMode === "off" ? { render: { status: "not_allowed" as const } } : {}) });
     return later ? afterDeferred(out, u.origin) : out;
   }
   // check never probes; it just revisits where it read from last time.
@@ -319,7 +326,7 @@ export async function run(tool: Tool, rawUrl: string, opts: Opts, meta: CallMeta
   // description, structured data), from an empty origin answer (Codex round 1).
   const shown = deferred ? pageOnly(u.origin) : od;
 
-  let { res, started, validatorsSent } = await fetchSource(source, cache, staleParse || rerender || !!sv, !!sv);
+  let { res, started, validatorsSent } = await fetchSource(source, cache, staleParse || needsBody || !!sv, !!sv);
   // An unsolicited 304 proves nothing about this parse or representation. Ask once for a full body.
   if (res.status === 304 && (!validatorsSent || staleParse)) {
     throwIfCancelled();

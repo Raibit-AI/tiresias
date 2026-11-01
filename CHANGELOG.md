@@ -2,6 +2,26 @@
 
 Built from docs/SPEC.md, section 10, which has the full detail of every version.
 
+## v1.0.1 (2026-11-01)
+
+- Cancelling a read while it waits its turn no longer adds extra delays to later requests.
+- An unexpected robots.txt “not modified” response is retried once; browsing stops if it answers “not modified” again without providing rules.
+- Malformed Retry-After headers keep the normal fallback cooldown.
+- Relative HTML links follow the page's first base URL; receipts still name the page that was read.
+- Rendered text with many lines stays readable when its final lines are visible. Incomplete geometry is reported as a partial inspection.
+- Emoji and other Unicode characters remain intact when text is split into blocks.
+- Large plain-format reads report how much text was omitted.
+- Cached pages honor the current rendering setting and each read's rendering request.
+- Markdown alternatives keep the original URL's query parameters.
+- Office text is withheld with its receipts when the reply cannot fit both.
+- Known archive signatures keep their archive warning even when the filename claims to be an Office document or application.
+- Concurrent page saves cannot exceed the snapshot cap or push out earlier evidence.
+- Replacing site restrictions no longer breaks unrelated browsing while confirmed restrictions are retained.
+- Active calls keep their starting settings, including their scanner and translator hooks.
+- Listing settings in private mode creates nothing and leaves folder permissions alone.
+- Resuming a handoff works when an unrelated storage limit is invalid.
+- History keeps questions up to 1,000 characters, marks longer cuts, and keeps questions that differ after character 500 separate in the needs report.
+
 ## v1.0.0 (2026-11-01)
 
 The first public release. Tiresias is a browser for AI agents with no screen: your agent calls it over MCP (or you run it from the command line), it reads a page into a short outline with numbered links, answers questions with exact quotes and receipts, and says honestly who is calling. It obeys robots.txt and every request to wait, stops at a CAPTCHA, a bot check or a login and hands the page to you, and runs on your machine under your keys, with no account and no telemetry. macOS and Linux; Windows is not supported yet.

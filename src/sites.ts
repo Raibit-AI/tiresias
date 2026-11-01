@@ -24,6 +24,7 @@
 // A bad "sites" value fails every call that sends a request, with an error naming the site and the setting
 // (fail closed: a broken entry might be a "never_visit"). clear and the daily trim never read it.
 import net from "node:net";
+import { readConfigObject } from "./config.js";
 import { inForceConfig } from "./confirm.js";
 import { callContext } from "./context.js";
 import { ConfigError, Refused, SafetyError } from "./errors.js";
@@ -39,6 +40,7 @@ export interface SiteRule {
 export const SITE_SETTINGS = ["spacing_seconds", "ports", "hand_off", "never_visit"] as const;
 export type SiteSettingName = (typeof SITE_SETTINGS)[number];
 export const MAX_SITES = 500;
+export const MAX_CONFIRMED_SITES = 5000;
 export const MIN_SPACING_S = 1;
 export const MAX_SPACING_S = 30;
 export const DEFAULT_PORTS: [number, number][] = [[80, 80], [443, 443], [8000, 8999]];
@@ -119,10 +121,10 @@ export function parseSiteRule(site: string, v: unknown): SiteRule {
   return out;
 }
 
-export function parseSites(v: unknown): Record<string, SiteRule> {
+export function parseSites(v: unknown, max = MAX_SITES): Record<string, SiteRule> {
   if (typeof v !== "object" || v === null || Array.isArray(v)) throw new ConfigError('config.json: "sites" must be an object, like {"example.com": {"spacing_seconds": 5}}.');
   const keys = Object.keys(v);
-  if (keys.length > MAX_SITES) throw new ConfigError(`config.json: "sites" has more than ${MAX_SITES} sites.`);
+  if (keys.length > max) throw new ConfigError(`config.json: "sites" has more than ${max} sites.`);
   const out: Record<string, SiteRule> = Object.create(null);
   for (const k of keys) {
     normalizeSite(k); // strict: the written form
@@ -132,8 +134,10 @@ export function parseSites(v: unknown): Record<string, SiteRule> {
 }
 
 export function loadSites(): Record<string, SiteRule> {
+  const raw = readConfigObject();
+  if (raw && Object.hasOwn(raw, "sites")) parseSites(raw.sites);
   const o = inForceConfig(); // W-32: an unconfirmed loosening is held back
-  return o && Object.hasOwn(o, "sites") ? parseSites(o.sites) : Object.create(null);
+  return o && Object.hasOwn(o, "sites") ? parseSites(o.sites, MAX_SITES + MAX_CONFIRMED_SITES) : Object.create(null);
 }
 
 // The entries that can apply to a host, most specific first: the host itself, then each wildcard above it.

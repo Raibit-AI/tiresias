@@ -128,15 +128,20 @@ export async function throttle(origin: string, delay: number, outer: AbortSignal
     await Promise.race([prev, cancelled]);
     // Holding the turn: first the cross-process lease (Codex round 76: waiting for it AFTER reserving a
     // slot let the slot go stale), then the shared slot and its spacing.
-    if (hold) activeRelease = await Promise.race([acquireActive(origin, mine.signal), cancelled]);
+    activeRelease = await Promise.race([acquireActive(origin, mine.signal), cancelled]);
     // W-25 (v0.6): a site's own spacing (sites.ts) raises the spacing. Like every spacing since v0.5.1 it is per
     // ORIGIN (scheme, host and port). Settings are the call's snapshot, read once when the call started
     // (coordinator's rule after Codex round 11): a change saved meanwhile applies to calls that start after it.
     const site = target ? siteSpacing(target) : 0;
     const eff = Math.max(delay, site);
-    const slot = reserve(origin, eff * 1000, Math.max((lastHit.get(origin) ?? 0) + eff * 1000, nextOk.get(origin) ?? 0));
-    const wait = slot - Date.now();
-    if (wait > 0) await Promise.race([sleep(wait, mine.signal), cancelled]);
+    for (;;) {
+      if (mine.signal.aborted) throw new Error("queue-cancelled");
+      if (cooldownLeft(origin) > 0) throw cooldownRefusal(origin, url);
+      const slot = reserve(origin, eff * 1000, Math.max((lastHit.get(origin) ?? 0) + eff * 1000, nextOk.get(origin) ?? 0), true);
+      const wait = slot - Date.now();
+      if (wait <= 0) break;
+      await Promise.race([sleep(wait, mine.signal), cancelled]);
+    }
     // The checks that matter: right before sending, not before queueing.
     if (mine.signal.aborted) throw new Error("queue-cancelled");
     if (cooldownLeft(origin) > 0) throw cooldownRefusal(origin, url);

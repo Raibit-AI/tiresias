@@ -1,6 +1,6 @@
 {
   "name": "@raibitsi/tiresias",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "The honest browser for AI agents. The browser you never open.",
   "license": "Apache-2.0",
   "author": "Raibit (https://raibit.ai/)",
@@ -33,6 +33,7 @@
     "!dist/test",
     "stubs",
     "README.md",
+    "CHANGELOG.md",
     "docs/QUICKSTART.md",
     "docs/DEMO.md",
     "LICENSE",

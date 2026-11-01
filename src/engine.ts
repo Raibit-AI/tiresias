@@ -29,10 +29,11 @@ export * from "./resume.js";
 export * from "./formflow.js";
 
 export const read = async (url: string, opts: Opts = {}, ctx: Ctx = DEFAULT) => {
+  const saveFallback = opts.save ? saveRefusal() : undefined;
   const out = await guarded("read", url, ctx, opts.question, (m) => run("read", url, opts, m, ctx.agent), {}, { create: { question: opts.question, section: opts.section, render: opts.render, translate: opts.translate } });
   // W-28 (v0.8): a read that asked to save always says what happened to the save (the pipeline sets it when it got
   // as far as a page or a file).
-  if (opts.save && !out.saved) addSaved(out, out.private ? { status: "private" } : saveRefusal());
+  if (opts.save && !out.saved) addSaved(out, out.private ? { status: "private" } : saveFallback!);
   return out;
 };
 function saveRefusal(): SavedTop {
