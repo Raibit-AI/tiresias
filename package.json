@@ -1,0 +1,64 @@
+{
+  "name": "@raibitsi/tiresias",
+  "version": "1.0.0",
+  "description": "The honest browser for AI agents. The browser you never open.",
+  "license": "Apache-2.0",
+  "author": "Raibit (https://raibit.ai/)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Raibit-AI/tiresias.git"
+  },
+  "homepage": "https://github.com/Raibit-AI/tiresias#readme",
+  "bugs": {
+    "url": "https://github.com/Raibit-AI/tiresias/issues"
+  },
+  "keywords": [
+    "ai-agents",
+    "mcp",
+    "browser",
+    "web-bot-auth",
+    "robots-txt",
+    "llms-txt",
+    "honest",
+    "headless",
+    "reader",
+    "receipts"
+  ],
+  "type": "module",
+  "bin": {
+    "tiresias": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "!dist/test",
+    "stubs",
+    "README.md",
+    "docs/QUICKSTART.md",
+    "docs/DEMO.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test --test-concurrency=1 dist/test/*.test.js",
+    "fuzz": "tsc && node scripts/fuzz.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "htmlparser2": "12.0.0",
+    "pdfjs-dist": "6.3.289",
+    "web-bot-auth": "0.2.0",
+    "zod": "4.6.7",
+    "@napi-rs/canvas": "file:stubs/no-canvas"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "typescript": "7.0.2"
+  },
+  "overrides": {
+    "@napi-rs/canvas": "$@napi-rs/canvas"
+  }
+}

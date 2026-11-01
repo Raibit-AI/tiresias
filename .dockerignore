@@ -1,0 +1,16 @@
+# Only what the image builds from: package files, stubs, tsconfig and src.
+node_modules
+dist
+docs
+examples
+scripts
+coverage
+.git
+.github
+.tiresias
+.env
+*.pem
+*.key
+*.jwk
+*.tgz
+.DS_Store

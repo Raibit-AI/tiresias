@@ -1,0 +1,3 @@
+# Check watched bookmarks at 07:00 every day and keep the plain summary.
+# Add bookmarks first:  tiresias bookmark add news https://example.com/news --watch
+0 7 * * * tiresias watch --text >> "$HOME/tiresias-watch.log" 2>&1

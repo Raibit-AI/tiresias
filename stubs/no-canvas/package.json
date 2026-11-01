@@ -1,0 +1,7 @@
+{
+  "name": "@napi-rs/canvas",
+  "version": "0.0.0-tiresias-stub",
+  "description": "Placeholder that keeps pdf.js's optional native canvas add-on out of Tiresias. Tiresias only extracts text, so it never draws.",
+  "main": "index.js",
+  "license": "Apache-2.0"
+}

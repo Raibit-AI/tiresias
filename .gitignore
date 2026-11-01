@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+*.pem
+*.key
+.tiresias/
+.DS_Store
+*.tgz
+coverage/
+
+# Codex review logs stay private (kept in the private repo).
+docs/reviews/

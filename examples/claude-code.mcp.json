@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tiresias": {
+      "command": "tiresias",
+      "args": ["mcp"]
+    }
+  }
+}
