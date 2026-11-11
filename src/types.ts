@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Shared shapes. The envelope matches SPEC section 6.1.
 
-export const VERSION = "1.1.0"
+export const VERSION = "1.1.1"
 // Bump when the reader changes what it extracts, so older cached pages are re-read.
-export const PARSER_VERSION = 16; // 16: v1.1.0 form recognition (cached form listings carry not_allowed). 15: v1.0.1 reader fixes. 14: v0.9.1 sweep ("(JSON)" heading generated, list indentation capped at 8 levels, markdown code kept as preformatted, nesting past 256 flattened). 13: v0.9 labels Tiresias makes ("(top of page)", "(structured data)") are marked generated, never quoted. 12: v0.7 language (W-26). 11: v0.6 calendar events (ics.ts). 10: v0.5.1 JSON as line blocks, W-22 reader. 9: W-20 file kinds (scripts, CSV, calendars and contacts read as plain text; SVG; file flags)
+export const PARSER_VERSION = 17; // 17: v1.1.1 whitespace-only form actions resolve against the base. 16: v1.1.0 form recognition (cached form listings carry not_allowed). 15: v1.0.1 reader fixes. 14: v0.9.1 sweep ("(JSON)" heading generated, list indentation capped at 8 levels, markdown code kept as preformatted, nesting past 256 flattened). 13: v0.9 labels Tiresias makes ("(top of page)", "(structured data)") are marked generated, never quoted. 12: v0.7 language (W-26). 11: v0.6 calendar events (ics.ts). 10: v0.5.1 JSON as line blocks, W-22 reader. 9: W-20 file kinds (scripts, CSV, calendars and contacts read as plain text; SVG; file flags)
 export const MAX_URL = 2048; // longer URLs are omitted (and counted), never shortened;
+// The render guard's scan of a page's form actions (forms.ts for the HTML, renderactions.ts for the live page).
+export const MAX_FORM_ACTIONS = 1000;
+export const MAX_FORM_BASES = 16; // distinct http(s) <base href> candidates in the static scan
+// 1,000 short shop actions (for example https://shop.example/cart/add, 29 characters)
+// fit comfortably. This is below the old live bound of 20 * 8,192 characters and
+// close to the old static bound of 20 * 2,048. Count repeats before deduplicating.
+export const MAX_FORM_ACTION_CHARS = 65_536;
 // Points at Raibit's page on raibit.ai, which links to the GitHub repo once it is public; it stays (Travis,
 // SPEC section 9, 2026-11-01).
 export const USER_AGENT = `Tiresias/${VERSION} (+https://raibit.ai/tiresias/)`;

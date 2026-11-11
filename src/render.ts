@@ -29,7 +29,7 @@ import { callContext } from "./context.js";
 import { Busy, Slots } from "./slots.js";
 import { ConfigError, TiresiasError, type FetchError } from "./errors.js";
 import { runUntrusted } from "./sandbox.js";
-import type { FullForm } from "./forms.js";
+import { MAX_FORM_ACTIONS, MAX_FORM_ACTION_CHARS, MAX_LIVE_ACTION, RenderActionCache } from "./renderactions.js";
 import { politeFetch } from "./fetcher.js";
 import { shutdownSignal } from "./lifetime.js";
 import { READ_SLACK, fetchCap } from "./safety.js";
@@ -424,8 +424,9 @@ export async function withRenderedPage<T>(pageUrl: string, body: string, fn: (p:
 async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) => Promise<T>): Promise<{ value: T; top: RenderTop }> {
   const chrome = findChrome();
   if (!chrome) throw new RenderUnavailable();
-  const forms = await runUntrusted<{ forms: FullForm[]; omitted: number }>({ op: "forms", body, url: pageUrl }, body.length);
-  const actions = forms.forms.filter((f) => f.method === "GET" && f.action).map((f) => getActionTarget(new URL(f.action!)));
+  const forms = await runUntrusted<{ actions: string[]; incomplete: boolean }>({ op: "form_actions", body, url: pageUrl }, body.length);
+  const actionCache = new RenderActionCache();
+  const actions = forms.incomplete ? null : actionCache.scan(forms.actions);
   hookExit();
   sweepProfiles();
   const started = Date.now();
@@ -538,7 +539,7 @@ async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) 
       if (method !== "GET") return await fail("not_get");
       const target = new URL(url);
       const actionTarget = getActionTarget(target);
-      if (forms.omitted || actions.some((a) => getActionTargetsMatch(a, actionTarget))) return await fail("form_action");
+      if (actions === null || actions.some((a) => getActionTargetsMatch(a, actionTarget))) return await fail("form_action");
       if (!TYPES_FETCHED.has(type)) return await fail("not_needed");
       // Check live forms too: scripts may have added a form or changed its action since the HTML arrived.
       try {
@@ -546,18 +547,66 @@ async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) 
         const r = await cmd<{ result?: { value?: unknown } }>("Runtime.evaluate", {
           contextId: world.executionContextId, returnByValue: true, timeout: 1000,
           expression: `(() => { /* get_form_actions */
-            const forms = Object.getOwnPropertyDescriptor(Document.prototype, 'forms').get.call(document);
-            if (forms.length > 20) return null;
-            const method = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'method').get;
-            const action = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'action').get;
+            const getter = (proto, name) => Object.getOwnPropertyDescriptor(proto, name).get;
+            const forms = getter(Document.prototype, 'forms').call(document);
+            const formCount = getter(HTMLCollection.prototype, 'length').call(forms);
+            const formAt = HTMLCollection.prototype.item;
+            // Native selectors and indexed access avoid named form properties and page wrappers.
+            // Include attributes on every element, even controls outside their form and non-controls.
+            const nodes = Document.prototype.querySelectorAll.call(document, '[formaction], [formmethod]');
+            const nodeCount = getter(NodeList.prototype, 'length').call(nodes);
+            if (formCount > ${MAX_FORM_ACTIONS} || nodeCount > ${LIMITS.elements}) return null;
+            const nodeAt = NodeList.prototype.item;
+            const attr = Element.prototype.getAttribute;
+            const localName = getter(Element.prototype, 'localName');
+            const namespace = getter(Element.prototype, 'namespaceURI');
+            const base = getter(Node.prototype, 'baseURI');
+            const page = getter(Document.prototype, 'URL').call(document);
+            const method = getter(HTMLFormElement.prototype, 'method');
+            const action = getter(HTMLFormElement.prototype, 'action');
+            const buttonAction = getter(HTMLButtonElement.prototype, 'formAction');
+            const buttonMethod = getter(HTMLButtonElement.prototype, 'formMethod');
+            const inputAction = getter(HTMLInputElement.prototype, 'formAction');
+            const inputMethod = getter(HTMLInputElement.prototype, 'formMethod');
             const out = [];
-            for (let i = 0; i < forms.length; i++) if (method.call(forms[i]).toLowerCase() === 'get') out.push(action.call(forms[i]));
+            let total = 0, count = formCount, getOverride = false;
+            const add = a => {
+              if (typeof a !== 'string' || a.length > ${MAX_LIVE_ACTION} || a.includes('\\0')) throw new Error('Unreadable action');
+              total += a.length;
+              if (total > ${MAX_FORM_ACTION_CHARS}) throw new Error('Action budget');
+              out.push(a);
+            };
+            for (let i = 0; i < nodeCount; i++) {
+              const n = nodeAt.call(nodes, i);
+              const name = namespace.call(n) === 'http://www.w3.org/1999/xhtml' ? localName.call(n) : '';
+              const actionGetter = name === 'button' ? buttonAction : name === 'input' ? inputAction : null;
+              const methodGetter = name === 'button' ? buttonMethod : name === 'input' ? inputMethod : null;
+              const fm = attr.call(n, 'formmethod');
+              if (fm !== null) {
+                const m = methodGetter ? methodGetter.call(n) : fm;
+                if (typeof m !== 'string') return null;
+                if (m.toLowerCase() !== 'post' && m.toLowerCase() !== 'dialog') getOverride = true;
+              }
+              const fa = attr.call(n, 'formaction');
+              if (fa !== null) {
+                if (++count > ${MAX_FORM_ACTIONS} || typeof fa !== 'string' || fa.length > ${MAX_LIVE_ACTION} || fa.includes('\\0')) return null;
+                // Non-controls have no formAction getter; apply the same URL rule ourselves.
+                const a = actionGetter ? actionGetter.call(n) : fa === '' ? page : new URL(fa, base.call(n)).href;
+                add(a);
+              }
+            }
+            for (let i = 0; i < formCount; i++) {
+              const f = formAt.call(forms, i);
+              const m = method.call(f);
+              if (typeof m !== 'string') return null;
+              if (!getOverride && (m.toLowerCase() === 'post' || m.toLowerCase() === 'dialog')) continue;
+              add(action.call(f));
+            }
             return out;
           })()`,
         }, pageSession);
-        const live = r.result?.value;
-        if (!Array.isArray(live) || live.length > 20 || live.some((a) => typeof a !== "string" || a.length > 8192)) return await fail("form_action");
-        if (live.some((a: string) => { const u = new URL(a, pageUrl); return getActionTargetsMatch(getActionTarget(u), actionTarget); })) return await fail("form_action");
+        const live = actionCache.scan(r.result?.value);
+        if (live === null || live.some((a) => getActionTargetsMatch(a, actionTarget))) return await fail("form_action");
       } catch { return await fail("form_action"); }
 
       if (top.requests! > LIMITS.requests) return await fail("request_cap");

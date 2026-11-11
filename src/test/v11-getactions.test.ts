@@ -201,11 +201,62 @@ test("R.12: disk observations gate routing variants in both directions without m
   }
 });
 
-// Last: filling the shared latch deliberately affects every subsequent guard in this process.
-test("r2: the shared full latch gates private and ordinary calls", () => {
+// Fresh module instances isolate capacity tests without adding a production reset hook.
+let capacityCase = 0;
+async function capacityActions() {
+  setup();
+  return import(new URL(`../getactions.js?capacity=${capacityCase++}`, import.meta.url).href) as Promise<typeof import("../getactions.js")>;
+}
+const atCapacity = Array.from({ length: 4096 }, (_, i) => ({ method: "GET", action: `https://capacity.example/${i}` }));
+const unrelated = new URL("https://unseen-capacity.example/plain");
+
+test("T.1: repeating a key at capacity does not latch", async () => {
+  const a = await capacityActions();
+  a.noteGetActions(atCapacity);
+  a.noteGetActions(form(atCapacity[0].action));
+  assert.doesNotThrow(() => a.guardGetAction(unrelated));
+  assert.throws(() => a.guardGetAction(new URL(atCapacity[0].action)), /permission slip/);
+  callContext.run({ private: true }, () => {
+    a.noteGetActions(atCapacity, true);
+    a.noteGetActions(form(atCapacity[0].action), true);
+    assert.doesNotThrow(() => a.guardGetAction(unrelated));
+  });
+});
+
+test("T.1: saved overflow does not latch and stays gated after cache eviction", async () => {
+  const a = await capacityActions();
+  const { cachePath, readJson } = await import("../store.js");
+  const { clearStore } = await import("../cleanup.js");
+  a.noteGetActions(atCapacity);
+  const target = new URL("https://saved-capacity.example/vote");
+  a.noteGetActions(form(target.href), true);
+  assert.doesNotThrow(() => a.guardGetAction(unrelated));
+  assert.equal(readJson<{ get_form_action: boolean }>(cachePath(`get-form:${getActionTarget(target)}`))?.get_form_action, true);
+  assert.throws(() => a.guardGetAction(target), /permission slip/);
+  await clearStore({ all: true });
+  assert.equal(readJson(cachePath(`get-form:${getActionTarget(target)}`)), null);
+  assert.throws(() => a.guardGetAction(target), /permission slip/, "eviction cannot forget a saved overflow target");
+  callContext.run({ private: true }, () => assert.throws(() => a.guardGetAction(target), /permission slip/));
+  assert.doesNotThrow(() => a.guardGetAction(unrelated));
+});
+
+for (const readOnly of [false, true]) test(`T.1: ${readOnly ? "read-only" : "unkept"} overflow stays gated without a shared latch`, async () => {
+  const a = await capacityActions();
+  a.noteGetActions(atCapacity);
+  callContext.run({ readOnly }, () => a.noteGetActions(form("https://unkept-capacity.example/vote"), readOnly));
+  const target = new URL("https://unkept-capacity.example/vote");
+  for (const privateCall of [false, true]) callContext.run({ private: privateCall }, () => {
+    assert.throws(() => a.guardGetAction(target), /permission slip/);
+    assert.doesNotThrow(() => a.guardGetAction(unrelated));
+  });
+});
+
+test("r2: shared overflow gates its target in private and ordinary calls, not unrelated addresses", () => {
   setup();
   noteGetActions(Array.from({ length: 4097 }, (_, i) => ({ method: "GET", action: `https://public-full.example/${i}` })));
-  const target = new URL("https://unknown.example/path");
-  assert.throws(() => guardGetAction(target), /permission slip/);
-  callContext.run({ private: true }, () => assert.throws(() => guardGetAction(target), /permission slip/));
+  const target = new URL("https://public-full.example/4096");
+  for (const privateCall of [false, true]) callContext.run({ private: privateCall }, () => {
+    assert.throws(() => guardGetAction(target), /permission slip/);
+    assert.doesNotThrow(() => guardGetAction(unrelated));
+  });
 });

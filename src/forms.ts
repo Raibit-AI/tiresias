@@ -18,7 +18,7 @@
 import { createHash } from "node:crypto";
 import { listsFor, stripAccents } from "./shieldphrases.js";
 import type { Lang } from "./lang.js";
-import { MAX_URL } from "./types.js";
+import { MAX_FORM_ACTIONS, MAX_FORM_ACTION_CHARS, MAX_FORM_BASES, MAX_URL } from "./types.js";
 
 interface N {
   type: string;
@@ -736,8 +736,8 @@ export function hasCardNumber(v: string | undefined): boolean {
 
 function resolveAction(raw: string | undefined, pageUrl: string, base: string): string | null {
   try {
-    // A missing or empty action sends to the page itself; otherwise it is resolved against <base href>.
-    const u = raw === undefined || raw.trim() === "" ? new URL(pageUrl) : new URL(raw.trim(), base);
+    // Only a missing or exactly empty action sends to the page itself. Whitespace is parsed against <base href>.
+    const u = raw === undefined || raw === "" ? new URL(pageUrl) : new URL(raw, base);
     if ((u.protocol !== "http:" && u.protocol !== "https:") || u.username || u.password) return null;
     u.hash = "";
     return u.href.length > MAX_URL ? null : u.href;
@@ -785,12 +785,14 @@ class FormBuilder {
 // Every <form> on the page, in order, with its fields. A form nested in another (invalid HTML) is
 // read as part of the outer one, as browsers do. Fields linked from outside a form with form="id"
 // are not included.
-export function extractForms(doc: N, pageUrl: string, flattened = false): { forms: FullForm[]; omitted: number } {
-  const budget = { left: TEXT_BUDGET };
+function scanForms(doc: N, pageUrl: string, actionsOnly = false) {
   let base = pageUrl;
   let baseSeen = false;
+  const bases = new Set<string>(); // render policy only; the listing keeps its first-base resolver
   const labelFor = new Map<string, N>();
   const formNodes: N[] = [];
+  const submitterNodes: N[] = []; // render policy only, including attributes on non-controls
+  let getOverride = false;
   const ids = new Map<string, N>(); // every element by id, for the audit
   const labelsFor = new Map<string, N[]>(); // every label for= of the page, for the audit
   type Up = { n: N; up: Up | null } | null; // ancestor chain, innermost first
@@ -809,13 +811,33 @@ export function extractForms(doc: N, pageUrl: string, flattened = false): { form
       continue;
     }
     const { n, inForm, up } = item;
-    if (++count > NODE_BUDGET) break; // forms past the budget are never found, so never sent
+    if (++count > NODE_BUDGET) break; // an incomplete action scan fails closed
     span.set(n, { a: clock++, z: Number.MAX_SAFE_INTEGER });
     stack.push({ close: n });
     let inside = inForm;
+    if (actionsOnly && (n.type === "tag" || n.type === "script" || n.type === "style")) {
+      const a = n.attribs ?? {};
+      // htmlparser2 preserves literal NULs; Chrome replaces them with U+FFFD. Numeric
+      // character references to zero already decode to U+FFFD in both parsers.
+      if ([a.action, a.formaction, n.name === "base" ? a.href : undefined].some(v => v?.includes("\0")))
+        return { incomplete: true, base, bases, formNodes, submitterNodes, getOverride, labelFor, ids, labelsFor, formUp, span };
+      if (a.formmethod !== undefined && !["post", "dialog"].includes(a.formmethod.toLowerCase())) getOverride = true;
+      if (a.formaction !== undefined) submitterNodes.push(n);
+      if (formNodes.length + submitterNodes.length > MAX_FORM_ACTIONS)
+        return { incomplete: true, base, bases, formNodes, submitterNodes, getOverride, labelFor, ids, labelsFor, formUp, span };
+    }
     if (n.type === "tag") {
       const a = n.attribs ?? {};
-      if (n.name === "base" && !baseSeen && a.href !== undefined) {
+      if (actionsOnly && n.name === "base" && a.href !== undefined) {
+        try {
+          const b = new URL(a.href, pageUrl);
+          if (b.protocol === "http:" || b.protocol === "https:") bases.add(b.href);
+        } catch {
+          // Invalid and non-web bases contribute no candidates; the page URL is always tried.
+        }
+        if (bases.size > MAX_FORM_BASES) return { incomplete: true, base, bases, formNodes, submitterNodes, getOverride, labelFor, ids, labelsFor, formUp, span };
+      }
+      if (!actionsOnly && n.name === "base" && !baseSeen && a.href !== undefined) {
         baseSeen = true;
         try {
           const b = new URL(a.href.trim(), pageUrl);
@@ -826,7 +848,8 @@ export function extractForms(doc: N, pageUrl: string, flattened = false): { form
       }
       if (n.name === "label" && a.for && !labelFor.has(a.for)) labelFor.set(a.for, n);
       if (n.name === "label" && a.for) labelsFor.set(a.for, [...(labelsFor.get(a.for) ?? []), n].slice(0, MAX_REFS + 1));
-      if (n.name === "form" && !inForm) {
+      if (n.name === "form" && (!inForm || actionsOnly)) {
+        if (actionsOnly && formNodes.length + submitterNodes.length >= MAX_FORM_ACTIONS) return { incomplete: true, base, bases, formNodes, submitterNodes, getOverride, labelFor, ids, labelsFor, formUp, span };
         formNodes.push(n);
         formUp.set(n, up);
         inside = true;
@@ -837,6 +860,44 @@ export function extractForms(doc: N, pageUrl: string, flattened = false): { form
     const next: Up = { n, up };
     if (n.children) for (let i = n.children.length - 1; i >= 0; i--) stack.push({ n: n.children[i], inForm: inside, up: next });
   }
+  return { incomplete: count > NODE_BUDGET, base, bases, formNodes, submitterNodes, getOverride, labelFor, ids, labelsFor, formUp, span };
+}
+
+export function extractFormActions(doc: N, pageUrl: string): { actions: string[]; incomplete: boolean } {
+  const { formNodes, submitterNodes, getOverride, bases, incomplete } = scanForms(doc, pageUrl, true);
+  if (incomplete) return { actions: [], incomplete: true };
+  const candidates = new Set([pageUrl, ...bases]);
+  const actions = new Set<string>();
+  let total = 0;
+  try {
+    const rawActions = formNodes.filter(f => {
+      // Invalid method values submit as GET in browsers. The listing still refuses them.
+      const method = (f.attribs?.method ?? "").toLowerCase();
+      return getOverride || (method !== "post" && method !== "dialog");
+    }).map(f => f.attribs?.action ?? "");
+    rawActions.push(...submitterNodes.map(n => n.attribs!.formaction));
+    for (const raw of rawActions) {
+      if (raw.length > MAX_URL) return { actions: [], incomplete: true };
+      // Take the union instead of guessing the browser's effective base or special-casing
+      // empty/whitespace actions. Include inert and later bases, and always the page URL.
+      for (const candidate of candidates) {
+        const action = new URL(raw, candidate);
+        if (action.href.length > MAX_URL || action.username || action.password) return { actions: [], incomplete: true };
+        total += Math.max(raw.length, action.href.length);
+        if (total > MAX_FORM_ACTION_CHARS) return { actions: [], incomplete: true };
+        if (action.protocol === "http:" || action.protocol === "https:") {
+          action.hash = "";
+          actions.add(action.href);
+        }
+      }
+    }
+    return { actions: [...actions], incomplete: false };
+  } catch { return { actions: [], incomplete: true }; }
+}
+
+export function extractForms(doc: N, pageUrl: string, flattened = false): { forms: FullForm[]; omitted: number } {
+  const { formNodes, base, labelFor, ids, labelsFor, formUp, span } = scanForms(doc, pageUrl);
+  const budget = { left: TEXT_BUDGET };
   const labelCache = new Map<N, string>();
   const labelText = (n: N) => {
     let t = labelCache.get(n);

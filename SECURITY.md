@@ -52,7 +52,27 @@ security problem. We answer within 5 working days.
   payment or purchase form, slip or not. The slip is the guarantee; the recognizing is best-effort (see below).
   Slips gate sending forms; following a link is an ordinary read. A site that changes
   something on a plain GET breaks HTTP's rule that GET is safe, and that is the site's doing. A rendered page's
-  scripts may not request a URL matching a GET form action on that page. Owners can tighten reads of known GET
+  scripts may not request a URL matching a GET form action on that page. This check covers up to 1,000 forms and `formaction` attributes together
+  in both the original HTML and the live page, with a 65,536-character total action budget per scan,
+  counting repeats (2,048 characters per HTML action, 8,192 per live action). Every subrequest is refused
+  past these limits, when the scan is incomplete or when an action is invalid, credentialed or unreadable.
+  The HTML scan guards the union of each raw action resolved against the page URL and every distinct
+  http(s) base anywhere in the parsed HTML, including templates and later bases. Non-web bases are
+  ignored; more than 16 distinct web bases makes the scan incomplete. Missing actions use the empty
+  string, without trimming. Every resolution counts toward the budget, including skipped non-web results.
+  Every `formaction` attribute on any element anywhere contributes an address, regardless of its method.
+  Any `formmethod` attribute other than post or dialog makes every form action count, including POST and
+  dialog forms. Without one, POST and dialog forms are skipped. Method comparisons ignore case but do not
+  trim. Literal U+0000 in action, formaction or base href attributes makes the HTML scan incomplete;
+  zero character references decode to U+FFFD and are checked normally. Valid non-web actions are skipped;
+  other form methods count as GET for this guard only. The live check calls native prototype selectors,
+  collection accessors and form, button and input getters in an isolated world, avoiding page wrappers
+  and named form properties. The page can still change the shared DOM, including methods, actions,
+  associations and bases, and remove a form between observations. The static parser is htmlparser2,
+  not Chrome's HTML parser: malformed foreign content can hide forms from the static scan, for example
+  `<math><annotation-xml><textarea><p><form action="/vote">`. The live check can see the resulting form
+  while it remains in the document; neither check proves every possible GET is safe.
+  The form listing stays capped at 20. Owners can tighten reads of known GET
   form actions to require a `submit_form` slip with `get_form_actions=slip`.
 - **Tiresias never logs in, never solves or bypasses a CAPTCHA, and never pretends to be a person's browser.**
   It refuses every sign-in form it recognizes and keeps no session: cookies last for one call. (Recognizing a
@@ -81,7 +101,14 @@ security problem. We answer within 5 working days.
 - **`get_form_actions=slip` matches other spellings of an address, not every address.** With that setting on,
   Tiresias asks for a slip before reading an address that is another spelling of a GET form action it has seen
   (encoding, case, dot segments, extra punctuation). It cannot know that a server sends a different address to the
-  same handler, such as `/vote.json` where the form said `/vote`.
+  same handler, such as `/vote.json` where the form said `/vote`. Ordinary reads learn only the first 20 listed
+  forms, so actions of later forms may be unknown. The guard keeps 4,096 distinct targets in memory; repeats
+  do not fill it further. Every further shared observation, including previews and read-only calls, enters
+  a bounded conservative filter that can require extra slips but cannot forget a target during the process,
+  even after cache eviction. Only private observations past their own 4,096-target limit make every GET
+  need a slip for that call. Private observations never enter shared memory or the shared filter. Every
+  call enforces its own observations, shared memory (exact set and filter) and surviving disk records.
+  Read-only calls cannot save observations. After restart, only surviving disk records remain.
 - **It cannot protect you from an agent that runs as you.** Anything that can run commands as you can edit the store,
   the settings and the confirmation record. Tiresias records changes and shows them in replies; it cannot stop them.
 - **Owner-set hooks inherit the owner's environment**, with Tiresias secret variables removed by default

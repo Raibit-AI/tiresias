@@ -3,6 +3,8 @@
 // a worker thread (worker.ts) when the input is big, so a hostile page that
 // makes one of them slow cannot stall the main thread: the main thread just
 // terminates the worker when the time budget runs out (sandbox.ts).
+import { parseDocument } from "./dom.js";
+import { extractFormActions } from "./forms.js";
 import { PdfError } from "./errors.js";
 import { ComplexityError, parseHtml, parseJsonText, parseMarkdown, parsePlain, parseSvg, topPassages, type Passage, type PlainMode } from "./reader.js";
 import { diffSections } from "./diff.js";
@@ -27,6 +29,7 @@ export type Job =
   | { op: "diff"; old: Section[]; new: Section[] } // W-02: block diff against the cached copy
   | { op: "blocklist"; body: string } // W-19: the downloaded Phishing.Database list, normalized
   | import("./inside.js").InsideJob // v0.6: inside a zip or an Office file (inside.ts), always in the worker
+  | { op: "form_actions"; body: string; url: string } // render policy only, never cached
   | { op: "forms"; body: string; url: string } // W-04: a page's forms WITH hidden values (preview and submit; never cached)
   | { op: "echo"; texts: string[]; secrets: import("./echo.js").Secrets }; // v0.9 item B: does a form answer repeat a secret?
 
@@ -63,6 +66,10 @@ function handleJob(job: Job): Done {
               })
             : null;
         return { result: { parsed, wall } };
+      }
+      case "form_actions": {
+        const tree = parseDocument(job.body);
+        return { result: tree.flattened ? { actions: [], incomplete: true } : extractFormActions(tree.doc, job.url) };
       }
       case "forms": {
         const keep: { forms?: import("./forms.js").FullForm[] } = {};

@@ -2,6 +2,16 @@
 
 Built from docs/SPEC.md, section 10, which has the full detail of every version.
 
+## v1.1.1 (2026-11-11)
+
+Five fixes, found by CodeRabbit's first review of v1.1.0 and by the review of the fixes. Three are cases where Tiresias refused more than it needed to: they erred on the safe side, and none let a page, a site or an agent do anything. The fourth closes a gap in the same check. The fifth corrects where one unusual form is sent.
+
+- With `get_form_actions=slip`, a Tiresias that had run long enough to see more than 4,096 GET form addresses asked for a slip on every read until it was restarted. It now keeps guarding the addresses it has seen and leaves other reads alone. After many thousands more, an unrelated address can now and then need a slip too. A private call that sees more than 4,096 of its own still needs a slip for every GET until that call ends.
+- Rendering works on pages with many forms. A page with more than 20 forms used to have every script and data request refused. Tiresias now checks up to 1,000 forms, in the HTML and in the live page, and a script's request that matches one of their GET addresses is still refused. Past 1,000 forms and buttons with an address of their own, past 65,536 characters of addresses, or when an address cannot be checked safely, every request is refused as before. Reads still list 20 forms.
+- A form that points at `javascript:` or `mailto:` no longer makes rendering refuse the page's scripts. A form with an unknown method now counts as a GET form in this check, as it does in browsers.
+- Rendering now also refuses a script's request to the address a button can send its form to (`formaction`). Before, only the form's own address was checked, so a page's script could request the button's address. A NUL character inside a form address, which a browser reads differently from Tiresias, now makes the check refuse every request.
+- A form whose address is written as blank space now goes where a browser would send it on a page that sets a base address: to that base address, not to the page. Before, the listing, the preview and the send all named the page. A slip was needed either way, and a preview made before this fix cannot be used to send. Cached pages are read again once.
+
 ## v1.1.0 (2026-11-10)
 
 The security deep dive. Every promise in SECURITY.md was attacked end to end, the way a hostile page or a fooled agent would, and each finding was fixed with a test or written down as a known limit in SECURITY.md.

@@ -10,6 +10,8 @@ import { after, test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { freshHome, html, logText, serve, text, type TestServer } from "./helper.js";
+import { parseDocument } from "../dom.js";
+import { buildRequest, extractForms } from "../forms.js";
 
 const FAKE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "tiresias-forms-home-"));
 process.env.HOME = FAKE_HOME; // the owner's real Web Risk key file is never read
@@ -147,6 +149,30 @@ async function site(): Promise<Site> {
 const CONTACT = { name: "Ann", email: "a@b.example", msg: "Hi\nthere" };
 const grant = (site: string, o: { uses?: string; path?: string } = {}) => slips.grant({ action: "submit_form", site, ...o });
 const ctx = { agent: "form-tester" };
+
+test("T.4: whitespace-only actions resolve against the base; missing and exactly empty actions use the page", () => {
+  const page = "https://page.example/page#fragment";
+  for (const raw of [" ", "\t", "\n", " \t\n\r ", "", undefined]) {
+    for (const base of ["", '<base href="https://base.example/dir/#fragment">']) {
+      const attribute = raw === undefined ? "" : `action="${raw}"`;
+      const form = extractForms(parseDocument(`${base}<form method="post" ${attribute}><input name="q"></form>`).doc, page).forms[0];
+      const expected = base && raw !== undefined && raw !== "" ? "https://base.example/dir/" : "https://page.example/page";
+      assert.equal(form.action, expected, JSON.stringify({ raw, base }));
+      assert.equal(form.not_allowed, undefined);
+      const request = buildRequest(form, page, { q: "hello" });
+      assert.ok("built" in request);
+      assert.equal(request.built.preview.url, expected);
+    }
+  }
+});
+
+test("T.4: whitespace has no written path, but the resolved base path must still be plain", () => {
+  for (const raw of [" ", "\t", "\n"]) {
+    const form = extractForms(parseDocument(`<base href="https://base.example/a;b/"><form action="${raw}"></form>`).doc, "https://page.example/page").forms[0];
+    assert.equal(form.action, "https://base.example/a;b/");
+    assert.equal(form.not_allowed, "unusual_path");
+  }
+});
 
 // v0.9 (item B): an answer that repeated a secret the site set comes back as fixed codes only.
 function assertWithheld(r: Awaited<ReturnType<typeof engine.formSubmit>>, status: number): void {
@@ -335,6 +361,33 @@ test("W-04 submit: a form that changed since the preview is refused and nothing 
   assert.equal((await engine.formSubmit(url, 1, { ...CONTACT, name: "Eve" }, p2.form!.preview_hash!, ctx)).form?.reason, "form_changed");
   assert.equal((await engine.formSubmit(url, 1, CONTACT, "not-a-hash", ctx)).form?.reason, "bad_preview_hash");
   assert.equal(t.posts.length, 0);
+});
+
+test("T.4: a preview for the old page action cannot submit to the base without a new preview", async () => {
+  newHome();
+  const markup = '<base href="/dir/"><form method="post" action=" "><input name="q"></form>';
+  const { s, hits } = await pageWith(markup);
+  const url = s.url + "/page";
+  const values = { q: "hello" };
+  const form = extractForms(parseDocument(markup).doc, url).forms[0];
+  // Reproduce the pre-fix preview: only its resolved action differs. The hash format is unchanged.
+  const old = buildRequest({ ...form, action: url }, url, values);
+  assert.ok("built" in old);
+  const g = grant(s.url); // covers both the old and new target, isolating the hash check
+  const read = await engine.read(url, {}, ctx);
+  assert.equal((read.untrusted_content as any).forms[0].action, s.url + "/dir/");
+  const refused = await engine.formSubmit(url, 1, values, old.built.preview_hash, ctx);
+  assert.equal(refused.form?.reason, "form_changed");
+  assert.deepEqual(hits, [], "no target request was sent");
+  assert.equal(slips.list().items.find(x => x.id === g.id)?.uses_left, 1);
+  const preview = await engine.formPreview(url, 1, values, ctx);
+  assert.equal(preview.status, "ok", preview.message);
+  assert.equal((preview.untrusted_content as any).request.url, s.url + "/dir/");
+  assert.notEqual(preview.form?.preview_hash, old.built.preview_hash);
+  const sent = await engine.formSubmit(url, 1, values, preview.form!.preview_hash!, ctx);
+  assert.equal(sent.form?.sent, true, sent.message);
+  assert.deepEqual(sent.form?.slip, { covered: true, id: g.id, use: 1 });
+  assert.deepEqual(hits, ["POST /dir/"]);
 });
 
 test("W-04 submit: a GET form needs a slip too, and sends its values in the query", async () => {

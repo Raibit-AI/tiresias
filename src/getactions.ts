@@ -2,14 +2,26 @@
 // Known GET form targets are policy, not a guess about what an arbitrary GET does.
 import { loadChoice } from "./config.js";
 import { Refused } from "./errors.js";
-import { cachePath, homeDir, isPrivate, readJson, writeJson } from "./store.js";
+import { cachePath, homeDir, isPrivate, readJson, sha256, writeJson } from "./store.js";
 import { normalizePath } from "./rules.js";
 import { callContext } from "./context.js";
 import { claimSlip, claimedStillValid } from "./slips.js";
 
 type Form = { method: string; action: string | null };
-const shared = { seen: new Set<string>(), full: false };
+const shared = { seen: new Set<string>() };
 const MAX_SEEN = 4096;
+// Every shared overflow target enters this fixed 8 KiB Bloom filter, saved or not.
+// With 65,536 bits and 4 probes, estimated false positive rates (uniform hashes) are
+// 0.239% at 4,096, 16.0% at 16,384 and 92.9% at 65,536 overflow targets. No false
+// negatives during this process; collisions only require extra slips. Private observations never enter it.
+const sharedOverflow = new Uint8Array(8192);
+function overflowBits(key: string): number[] {
+  const hash = sha256(key);
+  return [0, 4, 8, 12].map((i) => parseInt(hash.slice(i, i + 4), 16));
+}
+function inSharedOverflow(key: string): boolean {
+  return overflowBits(key).every((bit) => (sharedOverflow[bit >>> 3] & (1 << (bit & 7))) !== 0);
+}
 // A denial comparison, never a URL to send or a permission-slip scope. Reuse the robots path
 // normalizer for unreserved octets and escape case, then fold ambiguous server routing spellings
 // conservatively: repeated decoding, separators, path parameters, Unicode, case and dot segments.
@@ -68,9 +80,15 @@ export function noteGetActions(forms: Form[] = [], keep = false): void {
   for (const f of forms) {
     if (f.method !== "GET" || !f.action) continue;
     const key = actionKey(new URL(f.action));
-    if (state && state.seen.size < MAX_SEEN) state.seen.add(memoryKey(key));
-    else if (state) state.full = true; // never forget a known target when the in-memory policy fills up
-    if (keep && !isPrivate() && !callContext.getStore()?.readOnly) writeJson(cachePath(key), { get_form_action: true, fetched_at: new Date().toISOString() });
+    const mk = memoryKey(key);
+    const saved = keep && !isPrivate() && !callContext.getStore()?.readOnly;
+    if (state && !state.seen.has(mk)) {
+      if (state.seen.size < MAX_SEEN) state.seen.add(mk);
+      else if (state === shared) for (const bit of overflowBits(mk)) sharedOverflow[bit >>> 3] |= 1 << (bit & 7);
+      else if ("full" in state) state.full = true; // private overflow fails closed only for this call
+    }
+    // Record policy in memory before writing, so a failed write also fails closed.
+    if (saved) writeJson(cachePath(key), { get_form_action: true, fetched_at: new Date().toISOString() });
   }
 }
 
@@ -80,7 +98,7 @@ export function guardGetAction(u: URL): void {
   const key = `get-form:${target}`;
   const state = callContext.getStore()?.getActions;
   const wildcard = `get-form:${new URL(target).origin}/*`;
-  const known = key === wildcard || [state, shared].some((s) => s?.full || s?.seen.has(memoryKey(key)) || s?.seen.has(memoryKey(wildcard))) ||
+  const known = key === wildcard || [key, wildcard].some((k) => inSharedOverflow(memoryKey(k))) || state?.full || [state, shared].some((s) => s?.seen.has(memoryKey(key)) || s?.seen.has(memoryKey(wildcard))) ||
     [key, wildcard].some((k) => readJson<{ get_form_action?: boolean }>(cachePath(k))?.get_form_action === true);
   if (!known) return;
   const claim = claimSlip("submit_form", u.href, "get_form_action");
