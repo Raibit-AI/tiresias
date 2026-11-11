@@ -17,7 +17,7 @@
 // Sites, URLs and questions come from records (the web and the agents), so they
 // are returned inside untrusted_content. Counts and fixed text sit at the top level.
 import { bound, type HistoryEntry } from "./history.js";
-import { listLogs, pageLog, parseSince, utcDay } from "./store.js";
+import { listLogs, pageLog, parseSince, utcDay, type LogScan } from "./store.js";
 import { NOTICE, jsonBytes } from "./types.js";
 
 export const DEFAULT_SINCE = "30d";
@@ -53,6 +53,7 @@ export interface HandoffCounts {
   tickets: number; // reads that stopped at a wall and kept a ticket
   refused_cap: number; // walls where no ticket was kept because 500 were open
   resolved_retry: number; // resumes that read the page by asking the site again
+  resolved_agent?: number; // resumes that read text an agent provided
   resolved_person: number; // resumes that read a page a person provided
 }
 // W-19, from history records in the window: calls stopped by each source, and reads that went past a list flag.
@@ -125,7 +126,7 @@ const hostOf = (url: string): string | null => {
   }
 };
 
-export async function buildNeeds(sinceText = DEFAULT_SINCE, page = 1, now = Date.now()): Promise<NeedsReport> {
+export async function buildNeeds(sinceText = DEFAULT_SINCE, page = 1, now = Date.now(), scan: LogScan = {}): Promise<NeedsReport> {
   const since = parseSince(sinceText) ?? now - 30 * 86_400_000;
   const firstDay = utcDay(since);
   const walls = new Tally("walls");
@@ -166,7 +167,10 @@ export async function buildNeeds(sinceText = DEFAULT_SINCE, page = 1, now = Date
     }
     if (e.ticket === "created") hand.tickets++;
     else if (e.ticket === "refused_cap") hand.refused_cap++;
-    if (e.tool === "resume" && (e.status === "ok" || (e.status === "unchanged" && !e.source))) hand[e.source ? "resolved_person" : "resolved_retry"]++;
+    if (e.tool === "resume" && (e.status === "ok" || (e.status === "unchanged" && !e.source))) {
+      if (e.source === "provided_by_agent") hand.resolved_agent = (hand.resolved_agent ?? 0) + 1;
+      else hand[e.source ? "resolved_person" : "resolved_retry"]++;
+    }
     if (e.status === "wall") walls.add(`${host}\n${e.reason ?? ""}`, { host, reason: e.reason ?? "unknown" });
     if (e.tool === "read" && e.matched === 0 && typeof e.purpose === "string")
       empty.add(`${host}\n${e.purpose}`, { host, question: e.purpose });
@@ -191,7 +195,7 @@ export async function buildNeeds(sinceText = DEFAULT_SINCE, page = 1, now = Date
       if (e.llms_txt) s.door = true;
     }
     return false; // collect only; nothing is kept in pages
-  });
+  }, 1, 40_000, scan);
 
   const wallRows = walls.rows();
   const emptyRows = empty.rows();
@@ -299,7 +303,7 @@ export function toMarkdown(r: NeedsReport): string {
     L.push(`- Pages read more than once: ${c.rereads.groups} (${c.rereads.records} reads).`);
     L.push(`- Sites visited ${OFTEN}+ times with no agent door: ${c.no_door.groups}.`);
     const hc = c.handoffs;
-    L.push(`- Handoff tickets kept at walls: ${hc.tickets}${hc.refused_cap ? ` (${hc.refused_cap} more refused at the cap)` : ""}; resolved by a retry: ${hc.resolved_retry}; by a page a person provided: ${hc.resolved_person}. Expired tickets are not counted.`);
+    L.push(`- Handoff tickets kept at walls: ${hc.tickets}${hc.refused_cap ? ` (${hc.refused_cap} more refused at the cap)` : ""}; resolved by a retry: ${hc.resolved_retry}; by a page a person provided: ${hc.resolved_person}${hc.resolved_agent ? `; by text an agent provided: ${hc.resolved_agent}` : ""}. Expired tickets are not counted.`);
     const fc = c.flagged;
     if (fc) L.push(`- Safe Browsing: ${fc.phishing_list} stopped by Phishing.Database, ${fc.web_risk} refused by Google Web Risk, ${fc.read_anyway} read anyway with allow_flagged.`);
     const fl = c.files;

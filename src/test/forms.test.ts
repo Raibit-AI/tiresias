@@ -215,7 +215,7 @@ test("W-04 read: at most 20 forms and 100 fields per form, counted when cut; a c
   assert.equal(p.form?.not_allowed, "too_many_fields");
 });
 
-test("W-04 preview: the exact request with hidden values masked, a preview hash, the slip state; nothing is written", async () => {
+test("W-04 preview: the exact request with hidden values masked, a preview hash, the slip state; only spacing is written", async () => {
   const home = newHome();
   const t = await site();
   const p = await engine.formPreview(t.s.url + "/contact", 1, CONTACT, ctx);
@@ -231,7 +231,7 @@ test("W-04 preview: the exact request with hidden values masked, a preview hash,
   assert.equal(req.body, "csrf=[set by the site]&name=Ann&email=a%40b.example&phone=&msg=Hi%0D%0Athere&topic=support&via=email");
   assert.doesNotMatch(JSON.stringify(p), /TOKEN-/);
   assert.equal(t.posts.length, 0, "nothing was sent");
-  assert.deepEqual(tree(home), [], "nothing was written: not even the store folder");
+  assert.ok(tree(home).every((f) => f === "hosts" || f.startsWith("hosts/")), "only shared spacing was written");
   // The hash does not depend on the hidden value (a new token every visit), only on the form and the values.
   const again = await engine.formPreview(t.s.url + "/contact", 1, CONTACT, ctx);
   assert.equal(again.form?.preview_hash, p.form?.preview_hash);
@@ -520,7 +520,7 @@ test("W-04 CLI: form preview takes --set and --unset; form submit without --prev
 
 function snapshot(dir: string): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const f of tree(dir)) {
+  for (const f of tree(dir).filter((f) => f !== "hosts" && !f.startsWith("hosts/"))) {
     const p = path.join(dir, f);
     out[f] = fs.statSync(p).isFile() ? fs.readFileSync(p).toString("base64") : "<dir>";
   }
@@ -600,16 +600,16 @@ test("Codex round 51: encoded traversal in a form's action or a slip-matched URL
 test("Codex round 51: payment detection covers hidden fields and card-number values", async () => {
   newHome();
   const { s } = await pageWith(
-    `<form method="post" action="/pay"><input type="hidden" name="card_number" value="1"><input type="hidden" name="cvv" value="2"><input name="a"></form>` +
-      `<form method="post" action="/pay"><input type="hidden" name="ref" value="4111-1111-1111-1111"><input name="a"></form>` +
-      `<form method="post" action="/pay"><input type="hidden" name="ref" value="4111-1111-1111-1112"><input name="a"></form>` +
-      `<form method="post" action="/pay"><textarea name="t">4111111111111111</textarea></form>`,
+    `<form method="post" action="/send"><input type="hidden" name="card_number" value="1"><input type="hidden" name="cvv" value="2"><input name="a"></form>` +
+      `<form method="post" action="/send"><input type="hidden" name="ref" value="4111-1111-1111-1111"><input name="a"></form>` +
+      `<form method="post" action="/send"><input type="hidden" name="ref" value="4111-1111-1111-1112"><input name="a"></form>` +
+      `<form method="post" action="/send"><textarea name="t">4111111111111111</textarea></form>`,
   );
   const r = await engine.read(s.url + "/page", {}, ctx);
   assert.deepEqual((r.untrusted_content as any).forms.map((f: any) => f.not_allowed ?? null), ["payment", "payment", null, "payment"]);
 });
 
-test("Codex round 51: preview writes nothing even with Safe Browsing on and a missing or stale list", async () => {
+test("Codex round 51: preview writes only spacing even with Safe Browsing on and a missing or stale list", async () => {
   const home = newHome();
   const t = await site();
   let listHits = 0;
@@ -758,7 +758,7 @@ test("Codex round 53: field names are allow-listed; a hidden role&#10;x and a vi
 
 test("Codex round 53: the payment check covers the whole request, the action's query of a POST included", async () => {
   newHome();
-  const { s, hits } = await pageWith(`<form method="post" action="/contact/pay?ref=4111111111111111"><input name="a"></form><form method="post" action="/contact/pay?ref=4111111111111112"><input name="a"></form>`);
+  const { s, hits } = await pageWith(`<form method="post" action="/contact/send?ref=4111111111111111"><input name="a"></form><form method="post" action="/contact/send?ref=4111111111111112"><input name="a"></form>`);
   grant(s.url, { uses: "5" });
   const p = await engine.formPreview(s.url + "/page", 1, { a: "1" }, ctx);
   assert.equal(p.form?.not_allowed, "payment");

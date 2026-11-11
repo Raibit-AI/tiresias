@@ -169,9 +169,9 @@ export function createServer(): McpServer {
         page: PAGE,
       },
     },
-    async ({ url, since, page }) => {
+    async ({ url, since, page }, extra) => {
       try {
-        const r = await engine.queryReceipts({ url, since, page });
+        const r = await engine.queryReceipts({ url, since, page }, { signal: extra.signal, deadline: Date.now() + 60_000 });
         // Counts and page numbers are Tiresias's own; the records came from the web.
         return text(receiptsEnvelope(url ?? "", r));
       } catch {
@@ -192,9 +192,9 @@ export function createServer(): McpServer {
         page: PAGE,
       },
     },
-    async ({ since, site, agent, page }) => {
+    async ({ since, site, agent, page }, extra) => {
       try {
-        const r = await engine.queryHistory({ since, site, agent, page });
+        const r = await engine.queryHistory({ since, site, agent, page }, { signal: extra.signal, deadline: Date.now() + 60_000 });
         // Records hold URLs, agent names and purposes from outside, so they sit inside untrusted_content.
         return text(historyEnvelope(r));
       } catch {
@@ -214,9 +214,9 @@ export function createServer(): McpServer {
         page: PAGE,
       },
     },
-    async ({ day, page }) => {
+    async ({ day, page }, extra) => {
       try {
-        const r = await engine.dailyLog(day, page);
+        const r = await engine.dailyLog(day, page, { signal: extra.signal, deadline: Date.now() + 60_000 });
         // URLs and agent text in the log came from outside, so the page sits inside untrusted_content.
         return text(listEnv("", { day: r.day, entries: r.entries, log: r.text }, { page: r.page, pages: r.pages, total: r.entries }));
       } catch (e) {
@@ -291,7 +291,7 @@ export function createServer(): McpServer {
       title: "Resume after a wall",
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       description:
-        "Pick up a read that stopped at a wall, by its handoff ticket, once a person is through. Without text: runs the same read again (a wall still there comes back with the same ticket). With text: the page the person saved, read with NO request to the site (source: provided_by_person).",
+        "Pick up a read that stopped at a wall, by its handoff ticket, once a person is through. Without text: runs the same read again (a wall still there comes back with the same ticket). With text: agent-supplied page text, read with NO request to the site (source: provided_by_agent); Tiresias cannot verify that a person supplied it.",
       inputSchema: {
         ticket: z.string().describe("The ticket id from handoff.ticket"),
         text: z.string().optional().describe("The page as the person saved or copied it, after getting through the wall"),
@@ -353,7 +353,7 @@ export function createServer(): McpServer {
       title: "Preview a form",
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
       description:
-        "Preview a form without sending it: returns the EXACT request form_submit would send (hidden values shown as [set by the site]), a preview_hash, and whether a permission slip covers the target (form.slip.covered). Nothing is sent or saved. Forms with a password, file upload, payment fields or a CAPTCHA are not_allowed.",
+        "Preview a form without sending it: returns the EXACT request form_submit would send (hidden values shown as [set by the site]), a preview_hash, and whether a permission slip covers the target (form.slip.covered). The previewed form is not sent. Minimal politeness state still applies; with the owner's get_form_actions=slip, fetching a known GET form action requires and spends a slip use. Sign-in, password, file upload, payment, purchase and CAPTCHA forms are not_allowed.",
       inputSchema: { url: z.string().describe("The page the form is on"), form: FORM, values: VALUES, private: PRIVATE },
     },
     async ({ url, form, values, private: priv }, extra) => {
@@ -398,9 +398,9 @@ export function createServer(): McpServer {
         page: PAGE,
       },
     },
-    async ({ since, page }) => {
+    async ({ since, page }, extra) => {
       try {
-        return text(await engine.needsReport(since, page));
+        return text(await engine.needsReport(since, page, { signal: extra.signal, deadline: Date.now() + 60_000 }));
       } catch (e) {
         return text(errorEnvelope("", (e as Error).message), true);
       }

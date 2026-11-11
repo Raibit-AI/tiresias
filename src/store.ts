@@ -8,7 +8,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
-import { TiresiasError } from "./errors.js";
+import { StringDecoder } from "node:string_decoder";
+import { FetchError, TiresiasError } from "./errors.js";
 
 export const NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
 // Added to every file open: a pipe planted where a file should be then fails at once instead of
@@ -392,7 +393,7 @@ export function readJson<T>(file: string): T | null {
 }
 
 // v0.5.1: private mode fails CLOSED in the store itself, not only at each call site: writeJson and
-// appendLine refuse inside a private call; the one exception is the Retry-After cooldown line.
+// appendLine refuse inside a private call except for Retry-After. hosts.ts writes only shared politeness state.
 export const PRIVATE_WRITE = "Private mode: Tiresias writes nothing to the store in a private call.";
 export class PrivateWriteError extends TiresiasError {
   readonly kind = "private_write";
@@ -466,7 +467,64 @@ export const randomTmp = (file: string) => `${file}.${randomBytes(8).toString("h
 
 export const MAX_LOG_READ = 8 * 1024 * 1024;
 
-// Read a JSONL log synchronously (used for cooldowns). Missing, foreign or
+export interface LogCursor {
+  dev: number;
+  ino: number;
+  offset: number;
+  pending: string;
+  decoder: StringDecoder;
+}
+
+// Replay a fixed snapshot in bounded chunks, then only appended bytes. An old line may still be a
+// site's rule, so start over only when the file is replaced or shrinks. Unreadable fails at the caller.
+export function scanLogSync<T>(name: string, take: (entry: T) => void, cursor?: LogCursor): LogCursor | undefined {
+  const h = readBase(scopeOf(name));
+  if (!h) return;
+  const file = path.join(h, name);
+  let fd: number;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | NOFOLLOW | NONBLOCK);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw e;
+  }
+  try {
+    ownFile(fd, file);
+    const { size, dev, ino } = fs.fstatSync(fd);
+    if (!cursor || cursor.dev !== dev || cursor.ino !== ino || size < cursor.offset) {
+      cursor = { dev, ino, offset: 0, pending: "", decoder: new StringDecoder("utf8") };
+    }
+    if (size === cursor.offset) return cursor;
+    const buf = Buffer.alloc(64 * 1024);
+    const decoder = cursor.decoder;
+    let pending = cursor.pending;
+    const line = (raw: string) => {
+      if (!raw.trim()) return;
+      let entry: T;
+      try { entry = JSON.parse(raw) as T; } catch { return; }
+      take(entry);
+    };
+    for (let offset = cursor.offset; offset < size;) {
+      const n = fs.readSync(fd, buf, 0, Math.min(buf.length, size - offset), offset);
+      if (!n) throw new Error("Cooldown log changed while reading.");
+      offset += n;
+      pending += decoder.write(buf.subarray(0, n));
+      let start = 0, end: number;
+      while ((end = pending.indexOf("\n", start)) >= 0) {
+        line(pending.slice(start, end));
+        start = end + 1;
+      }
+      pending = pending.slice(start);
+      if (pending.length > 64 * 1024) throw new Error("Cooldown record is too large.");
+    }
+    line(pending); // a complete final record counts even without a newline
+    return { dev, ino, offset: size, pending, decoder }; // keep a partial record for the next append
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Read a bounded tail of a JSONL log. Missing, foreign or
 // symlinked files read as empty; damaged and blank lines are skipped.
 // A file over `maxBytes` is read from its LAST maxBytes only, starting at the
 // first full line after the cut, so a runaway log cannot stall a request.
@@ -563,16 +621,30 @@ export interface LogPage<T> {
   total: number;
 }
 
+export interface LogScan {
+  signal?: AbortSignal;
+  deadline?: number;
+}
+
 // Stream the log, never loading it whole. Matching lines are packed into pages
 // of at most `budget` bytes; only the requested page is kept in memory.
 // `names` may be several files (oldest first); they read as one log.
-export async function pageLog<T>(names: string | string[], keep: (x: T) => boolean, page = 1, budget = 40_000): Promise<LogPage<T>> {
+export async function pageLog<T>(names: string | string[], keep: (x: T) => boolean, page = 1, budget = 40_000, scan: LogScan = {}): Promise<LogPage<T>> {
+  const signal = scan.signal ?? callContext.getStore()?.signal;
+  const deadline = scan.deadline ?? Date.now() + 60_000;
+  let expired = false;
+  const check = () => {
+    if (signal?.aborted) throw new FetchError("The request was cancelled.", "cancelled");
+    if (expired || Date.now() >= deadline) throw new FetchError("The log scan took too long.", "timeout");
+  };
+  check();
   const out: LogPage<T> = { items: [], page, pages: 0, total: 0 };
   const h = readHome();
   if (!h) return out;
   let cur = 0;
   let bytes = 0;
   for (const name of Array.isArray(names) ? names : [names]) {
+    check();
     const file = path.join(h, name);
     let fd: number;
     try {
@@ -580,30 +652,47 @@ export async function pageLog<T>(names: string | string[], keep: (x: T) => boole
     } catch {
       continue;
     }
+    let size: number;
     try {
       ownFile(fd, file);
+      size = fs.fstatSync(fd).size;
     } catch {
       fs.closeSync(fd); // do not leak the descriptor when the file is rejected
       continue;
     }
-    const rl = readline.createInterface({ input: fs.createReadStream(file, { fd, autoClose: true }), crlfDelay: Infinity });
-    for await (const line of rl) {
-      if (!line.trim()) continue;
-      let obj: T;
-      try {
-        obj = JSON.parse(line) as T;
-      } catch {
-        continue; // skip a damaged line rather than lose the whole log
+    if (!size) { fs.closeSync(fd); continue; }
+    // A concurrent writer cannot extend this scan beyond the file's starting end offset.
+    const input = fs.createReadStream(file, { fd, autoClose: true, end: size - 1 });
+    const rl = readline.createInterface({ input, crlfDelay: Infinity });
+    const stop = () => { rl.close(); input.destroy(); };
+    const timer = setTimeout(() => { expired = true; stop(); }, Math.max(0, deadline - Date.now()));
+    signal?.addEventListener("abort", stop, { once: true });
+    try {
+      check();
+      for await (const line of rl) {
+        check();
+        if (!line.trim()) continue;
+        let obj: T;
+        try {
+          obj = JSON.parse(line) as T;
+        } catch {
+          continue; // skip a damaged line rather than lose the whole log
+        }
+        if (!keep(obj)) continue;
+        out.total++;
+        const size = Buffer.byteLength(line, "utf8"); // UTF-8 bytes, not characters (Codex round 38)
+        if (cur === 0 || bytes + size > budget) {
+          cur++;
+          bytes = 0;
+        }
+        bytes += size;
+        if (cur === page) out.items.push(obj);
       }
-      if (!keep(obj)) continue;
-      out.total++;
-      const size = Buffer.byteLength(line, "utf8"); // UTF-8 bytes, not characters (Codex round 38)
-      if (cur === 0 || bytes + size > budget) {
-        cur++;
-        bytes = 0;
-      }
-      bytes += size;
-      if (cur === page) out.items.push(obj);
+      check();
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", stop);
+      stop();
     }
   }
   out.pages = cur;

@@ -8,7 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import { verifierFromJWK } from "web-bot-auth/crypto";
 import { SigningError, SlipError } from "./errors.js";
-import { NOFOLLOW, NONBLOCK, homeDir, isPrivate, ownFile, randomTmp, subDir } from "./store.js";
+import { releaseLock, takeLock } from "./savedlock.js";
+import { NOFOLLOW, NONBLOCK, homeDir, isPrivate, ownFile, randomTmp, rmRegular, subDir } from "./store.js";
 
 export const KEY_FILE = "ed25519.private.jwk";
 
@@ -203,6 +204,7 @@ function derive(jwk: PrivateJwk, k: KeyKind = SIGNING): PrivateJwk {
 export interface KeyState {
   stamp: string; // changes whenever the file changes
   jwk?: PrivateJwk; // present only when the contents were (re)read
+  raw?: Record<string, unknown>; // the file's own JSON, for the extra fields of the previous key (v1.1)
 }
 
 // Look at the key file, with the FULL set of checks on every call: the store and keys/ folders (real
@@ -243,7 +245,7 @@ function inspectKeyFile(name: string, k: KeyKind, knownStamp?: string): KeyState
       throw damagedKey(k, "not valid JSON");
     }
     if (!isKey(jwk)) throw damagedKey(k, "not an Ed25519 key");
-    return { stamp, jwk: derive(jwk, k) };
+    return { stamp, jwk: derive(jwk, k), raw: jwk as unknown as Record<string, unknown> };
   } catch (e) {
     if (e instanceof k.Err) throw e;
     throw new k.Err(`The ${k.label} file cannot be used (${(e as Error).message.replace(/[\r\n]/g, " ").slice(0, 120)}). ${k.refuse}`);
@@ -257,9 +259,11 @@ export function readPrivateJwk(): PrivateJwk | null {
   return inspectKey()?.jwk ?? null;
 }
 
-export async function publicInfo(jwk: { x: string }): Promise<PublicInfo> {
+export async function publicInfo(jwk: { x: string }, previous?: { x: string } | null): Promise<PublicInfo> {
   const pub = { kty: "OKP" as const, crv: "Ed25519" as const, x: jwk.x };
-  return { public_jwk: pub, keyid: (await verifierFromJWK(pub)).keyid, directory: { keys: [pub] } };
+  const keys = [pub];
+  if (previous && previous.x !== jwk.x) keys.push({ kty: "OKP", crv: "Ed25519", x: previous.x });
+  return { public_jwk: pub, keyid: (await verifierFromJWK(pub)).keyid, directory: { keys } };
 }
 
 export const DIRECTORY_PATH = "/.well-known/http-message-signatures-directory";
@@ -280,23 +284,46 @@ export async function signDirectory(opts: { host: string; days: number; now?: nu
     throw bad();
   }
   if (!Number.isInteger(opts.days) || opts.days < 1 || opts.days > 90) throw new Error("--days must be a whole number from 1 to 90.");
-  const jwk = readPrivateJwk();
-  if (!jwk) throw new Error("No signing key yet. Run: tiresias keys init");
-  const info = await publicInfo(jwk);
-  const created = Math.floor((opts.now ?? Date.now()) / 1000);
-  const expires = created + opts.days * 86_400;
-  const nonce = randomBytes(64).toString("base64");
-  const params = `("@authority";req);created=${created};keyid="${info.keyid}";alg="ed25519";expires=${expires};nonce="${nonce}";tag="http-message-signatures-directory"`;
-  const base = `"@authority";req: ${host}\n"@signature-params": ${params}`;
-  const sig = edSign(null, Buffer.from(base), createPrivateKey({ key: { kty: "OKP", crv: "Ed25519", d: jwk.d, x: jwk.x }, format: "jwk" })).toString("base64");
+  const now = opts.now ?? Date.now();
+  const pub = await publishedKeys(now);
+  const created = Math.floor(now / 1000);
+  let expires = created + opts.days * 86_400;
+  // v1.1: during a rotation's overlap window the directory lists two keys and carries one signature per key.
+  // Its signatures end when the window does, so a static copy never keeps publishing the old key past it.
+  const signers: PrivateJwk[] = [pub.jwk];
+  let capped: string | undefined;
+  if (pub.previous) {
+    const end = Math.floor(Date.parse(pub.previous.until) / 1000);
+    if (end > created) {
+      signers.push(pub.previous.jwk);
+      if (end < expires) {
+        expires = end;
+        capped = pub.previous.until;
+      }
+    }
+  }
+  const body = { keys: signers.map((j) => ({ kty: "OKP" as const, crv: "Ed25519" as const, x: j.x })) };
+  const sigs: string[] = [];
+  const inputs: string[] = [];
+  for (const [i, j] of signers.entries()) {
+    const keyid = (await verifierFromJWK({ kty: "OKP", crv: "Ed25519", x: j.x })).keyid;
+    const nonce = randomBytes(64).toString("base64");
+    const params = `("@authority";req);created=${created};keyid="${keyid}";alg="ed25519";expires=${expires};nonce="${nonce}";tag="http-message-signatures-directory"`;
+    const base = `"@authority";req: ${host}\n"@signature-params": ${params}`;
+    const sig = edSign(null, Buffer.from(base), createPrivateKey({ key: { kty: "OKP", crv: "Ed25519", d: j.d, x: j.x }, format: "jwk" })).toString("base64");
+    sigs.push(`sig${i + 1}=:${sig}:`);
+    inputs.push(`sig${i + 1}=${params}`);
+  }
   return {
     host,
     path: DIRECTORY_PATH,
     created_at: new Date(created * 1000).toISOString(),
     expires_at: new Date(expires * 1000).toISOString(),
-    body: JSON.stringify(info.directory, null, 2) + "\n",
-    headers: { "Content-Type": DIRECTORY_TYPE, Signature: `sig1=:${sig}:`, "Signature-Input": `sig1=${params}` },
-    keyid: info.keyid,
+    body: JSON.stringify(body, null, 2) + "\n",
+    headers: { "Content-Type": DIRECTORY_TYPE, Signature: sigs.join(", "), "Signature-Input": inputs.join(", ") },
+    keyid: pub.info.keyid,
+    ...(pub.previous && signers.length > 1 ? { previous_keyid: pub.previous.keyid, previous_until: pub.previous.until } : {}),
+    ...(capped ? { capped_by_rotation: capped } : {}),
   };
 }
 
@@ -306,6 +333,13 @@ export async function initKey(force = false): Promise<PublicInfo & { file: strin
   const why = syncedFolderReason();
   if (why) throw new Error(why);
   const d = keysDir(true)!;
+  // Codex K.8: replacing the key and dropping the previous one hold the rotation lock, like a rotation does, so a
+  // rotation running at the same moment cannot have its freshly kept key deleted.
+  const r = withRotateLock(d, 1000, () => initLocked(d, force));
+  if (r === BUSY) throw new Error("A key rotation is under way. Try again in a moment. Nothing was changed.");
+  return { ...(await publicInfo(r.jwk)), file: r.file, replaced: r.replaced };
+}
+function initLocked(d: string, force: boolean): { jwk: { x: string }; file: string; replaced: boolean } {
   const file = path.join(d, KEY_FILE);
   let exists = false;
   try {
@@ -334,7 +368,244 @@ export async function initKey(force = false): Promise<PublicInfo & { file: strin
   }
   fs.closeSync(fd);
   if (exists) fs.renameSync(target, file);
-  return { ...(await publicInfo(jwk)), file, replaced: exists };
+  // v1.1: a fresh start leaves no earlier key in the directory (a rotation's previous key goes too).
+  rmRegular(path.join(d, PREVIOUS_KEY_FILE));
+  sweepPreviousTmp(d);
+  return { jwk, file, replaced: exists };
+}
+
+// ---- v1.1 workstream 4: rotating the signing key ----
+// `keys rotate` makes a new key and keeps the old one for an overlap window (default 7 days, 0 to 30), so sites
+// that cached the old directory still recognise requests signed before the switch, and so the new directory can
+// carry one signature per key, as Cloudflare asks. During the window:
+// - new requests are signed with the NEW key only (signing.ts reads only ed25519.private.jwk);
+// - keys show, keys directory and keys sign-directory publish both public keys;
+// - the old private key is kept in keys/ed25519.previous.jwk (same storage rules), used for nothing but signing
+//   the directory response, and deleted when the window ends (at the next keys command that looks) or on
+//   `keys rotate --finish`. `--overlap 0` keeps nothing: the old key is gone at once (the choice after a leak).
+// A second rotation inside the window is refused until --finish, so no key is ever lost silently.
+export const PREVIOUS_KEY_FILE = "ed25519.previous.jwk";
+export const DEFAULT_OVERLAP_DAYS = 7;
+export const MAX_OVERLAP_DAYS = 30;
+const DAY_MS = 86_400_000;
+const PREVIOUS: KeyKind = { label: "previous signing key", refuse: "Refusing to publish the key directory.", fix: "run `tiresias keys rotate --finish` to drop it", Err: SigningError };
+
+export interface PreviousKey {
+  jwk: PrivateJwk;
+  keyid: string;
+  rotated_at: string;
+  until: string;
+}
+
+// Write a private key file whole: a temp file made exclusively (0600, never following a link), synced, then put
+// in place by rename (replace) or hard link (exclusive: fails with EEXIST when the name is taken). A reader never
+// sees a half-written file. The temp file is always removed.
+function writeSecret(file: string, body: Buffer, how: "replace" | "exclusive"): void {
+  const tmp = randomTmp(file);
+  const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW | NONBLOCK, 0o600);
+  try {
+    try {
+      for (let off = 0; off < body.length; ) off += fs.writeSync(fd, body, off, body.length - off);
+      fs.fchmodSync(fd, 0o600);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (how === "replace") fs.renameSync(tmp, file);
+    else fs.linkSync(tmp, file);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+const newKeyBody = (extra: Record<string, string> = {}): { jwk: PrivateJwk; body: Buffer } => {
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const j = privateKey.export({ format: "jwk" }) as { x: string; d: string };
+  const jwk: PrivateJwk = { kty: "OKP", crv: "Ed25519", x: j.x, d: j.d };
+  return { jwk, body: Buffer.from(JSON.stringify({ ...jwk, ...extra }) + "\n") };
+};
+
+// Rotations hold a lock (savedlock.ts: a dead owner is recovered, a live one never timed out), and anything that
+// deletes a previous key holds it too and looks again first. Without it a `keys show` that read the current key just
+// before a rotation could take the freshly kept old key for a leftover and delete it (Codex K.1).
+export const ROTATE_LOCK = "ed25519.rotate"; // keys/ed25519.rotate.lock
+const PREV_TMP = /^ed25519\.previous\.jwk\.[0-9a-f]{16}\.tmp$/;
+
+function withRotateLock<T>(d: string, tryMs: number, fn: () => T, name = ROTATE_LOCK): T | typeof BUSY {
+  const lock = path.join(d, name);
+  const token = takeLock(lock, tryMs);
+  if (!token) return BUSY;
+  try {
+    return fn();
+  } finally {
+    releaseLock(lock, token);
+  }
+}
+const BUSY = Symbol("busy");
+
+// A rotation killed between linking the previous-key temp file and removing it leaves a copy of the old private key
+// under a temp name (Codex K.2). Only rotations make these, and only under the lock, so under the lock any is a leftover.
+function sweepPreviousTmp(d: string): void {
+  for (const n of fs.readdirSync(d)) if (PREV_TMP.test(n)) rmRegular(path.join(d, n));
+}
+
+// Under the rotation lock: look again, and drop the previous key only if it is STILL expired or the same as the
+// current key. Busy (a rotation is running): nothing is deleted.
+function cleanPrevious(now: number): void {
+  if (isPrivate()) return; // a private session changes nothing; the expired key is only ignored
+  const d = keysDir(false);
+  if (!d) return;
+  withRotateLock(d, 250, () => cleanPreviousLocked(d, now));
+}
+function cleanPreviousLocked(d: string, now: number): void {
+  const s = inspectKeyFile(PREVIOUS_KEY_FILE, PREVIOUS);
+  if (s?.jwk) {
+    const until = typeof s.raw?.until === "string" ? Date.parse(s.raw.until) : NaN;
+    const cur = readPrivateJwk();
+    if (now >= until || (cur && cur.x === s.jwk.x)) rmRegular(path.join(d, PREVIOUS_KEY_FILE));
+  }
+  if (!fs.lstatSync(path.join(d, PREVIOUS_KEY_FILE), { throwIfNoEntry: false })) sweepPreviousTmp(d);
+}
+
+// The previous key while its window is open, or null. An expired window, and the leftover of a rotation cut short
+// (the same key as the current one), are removed here, under the rotation lock and after a second look; a stale
+// `current` from a caller never causes a delete. A damaged file is a SigningError (fix: --finish).
+export async function previousKey(now = Date.now(), current: { x: string } | null = readPrivateJwk(), locked = false): Promise<PreviousKey | null> {
+  const s = inspectKeyFile(PREVIOUS_KEY_FILE, PREVIOUS);
+  if (!s?.jwk) return null;
+  const until = typeof s.raw?.until === "string" ? Date.parse(s.raw.until) : NaN;
+  const rotated = typeof s.raw?.rotated_at === "string" ? Date.parse(s.raw.rotated_at) : NaN;
+  if (Number.isNaN(until) || Number.isNaN(rotated)) throw damagedKey(PREVIOUS, "its overlap dates are missing");
+  if (now >= until || (current && current.x === s.jwk.x)) {
+    if (locked) {
+      const d = keysDir(false);
+      if (d) cleanPreviousLocked(d, now);
+    } else cleanPrevious(now);
+    // Looked at again: a rotation may have finished meanwhile, making this a real previous key after all.
+    const again = inspectKeyFile(PREVIOUS_KEY_FILE, PREVIOUS);
+    const cur = readPrivateJwk();
+    if (!again?.jwk || now >= until || again.jwk.x !== s.jwk.x || !cur || cur.x === s.jwk.x) return null;
+  }
+  const keyid = (await verifierFromJWK({ kty: "OKP", crv: "Ed25519", x: s.jwk.x })).keyid;
+  return { jwk: s.jwk, keyid, rotated_at: new Date(rotated).toISOString(), until: new Date(until).toISOString() };
+}
+
+// What the directory publishes now: the current key, plus the previous one while its window is open.
+export async function publishedKeys(now = Date.now()): Promise<{ jwk: PrivateJwk; info: PublicInfo; previous: PreviousKey | null }> {
+  // A rotation can complete between these reads (and previousKey may await a verifier). Publish
+  // only a pair whose current key is still current after all async work. Retrying also leaves the
+  // existing busy-lock behaviour of read-only key commands intact.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const jwk = readPrivateJwk();
+    if (!jwk) throw new Error("No signing key yet. Run: tiresias keys init");
+    const previous = await previousKey(now, jwk);
+    const info = await publicInfo(jwk, previous?.jwk);
+    if (readPrivateJwk()?.x === jwk.x) return { jwk, info, previous };
+  }
+  throw new Error("The signing key changed while reading the directory. Try again in a moment.");
+}
+
+// The overlap value from the command line: whole days, 0 to 30.
+export function parseOverlap(raw: string | undefined): number {
+  if (raw === undefined) return DEFAULT_OVERLAP_DAYS;
+  if (!/^\d{1,3}$/.test(raw.trim()) || Number(raw) > MAX_OVERLAP_DAYS) throw new Error(`--overlap takes whole days from 0 to ${MAX_OVERLAP_DAYS} (default ${DEFAULT_OVERLAP_DAYS}).`);
+  return Number(raw);
+}
+
+export interface RotateResult extends PublicInfo {
+  file: string;
+  previous_keyid: string;
+  overlap_days: number;
+  overlap_until: string | null; // null: --overlap 0, the old key is gone already
+  rotated_at: string;
+}
+
+// Rotate the signing key. Returns only public facts; nothing private is ever returned or printed.
+export async function rotateKey(opts: { overlapDays?: number; now?: number } = {}): Promise<RotateResult> {
+  if (isPrivate()) throw new Error("Private mode: nothing is written, so no key is rotated.");
+  const why = syncedFolderReason();
+  if (why) throw new Error(why);
+  const days = opts.overlapDays ?? DEFAULT_OVERLAP_DAYS;
+  if (!Number.isInteger(days) || days < 0 || days > MAX_OVERLAP_DAYS) throw new Error(`--overlap takes whole days from 0 to ${MAX_OVERLAP_DAYS} (default ${DEFAULT_OVERLAP_DAYS}).`);
+  const now = opts.now ?? Date.now();
+  if (!readPrivateJwk()) throw new Error("No signing key yet. Run: tiresias keys init");
+  const d = keysDir(true)!;
+  const r = await withRotateLockAsync(d, () => rotateLocked(d, days, now));
+  if (r === BUSY) throw new Error("Another key rotation is under way. Try again in a moment. Nothing was changed.");
+  return r;
+}
+
+// The lock is synchronous and the key checks are async, so the async version releases in its own finally.
+async function withRotateLockAsync<T>(d: string, fn: () => Promise<T>): Promise<T | typeof BUSY> {
+  const lock = path.join(d, ROTATE_LOCK);
+  const token = takeLock(lock);
+  if (!token) return BUSY;
+  try {
+    return await fn();
+  } finally {
+    releaseLock(lock, token);
+  }
+}
+
+async function rotateLocked(d: string, days: number, now: number): Promise<RotateResult> {
+  const cur = readPrivateJwk();
+  if (!cur) throw new Error("No signing key yet. Run: tiresias keys init");
+  const open = await previousKey(now, cur, true);
+  if (open)
+    throw new Error(`A rotation is still in its overlap window: the previous key (${open.keyid}) stays in your directory until ${open.until}. Run \`tiresias keys rotate --finish\` to drop it now, then rotate again. Nothing was changed.`);
+  sweepPreviousTmp(d);
+  const file = path.join(d, KEY_FILE);
+  const prevFile = path.join(d, PREVIOUS_KEY_FILE);
+  const rotatedAt = new Date(now).toISOString();
+  const until = days > 0 ? new Date(now + days * DAY_MS).toISOString() : null;
+  let kept = false;
+  if (until) {
+    try {
+      writeSecret(prevFile, Buffer.from(JSON.stringify({ kty: "OKP", crv: "Ed25519", x: cur.x, d: cur.d, rotated_at: rotatedAt, until }) + "\n"), "exclusive");
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new Error("Another rotation is under way (a previous key appeared meanwhile). Run `tiresias keys show` to see where things stand. Nothing was changed.");
+      throw e;
+    }
+    kept = true;
+  }
+  const fresh = newKeyBody();
+  try {
+    // `keys init --force` since we read the key: stop, rather than lose a key nobody kept.
+    const again = readPrivateJwk();
+    if (!again || again.x !== cur.x) throw new Error("The signing key changed while rotating (another rotate or keys init ran). Nothing was replaced. Run `tiresias keys show` and try again.");
+    writeSecret(file, fresh.body, "replace");
+  } catch (e) {
+    if (kept) rmRegular(prevFile);
+    throw e;
+  }
+  const info = await publicInfo(fresh.jwk, until ? cur : null);
+  return { ...info, file, previous_keyid: (await publicInfo(cur)).keyid, overlap_days: days, overlap_until: until, rotated_at: rotatedAt };
+}
+
+// End the overlap now: the previous key leaves the directory and its private half is deleted.
+export async function finishRotation(): Promise<{ finished: boolean; previous_keyid?: string }> {
+  if (isPrivate()) throw new Error("Private mode: nothing is written, so nothing is changed.");
+  const d = keysDir(false);
+  if (!d) return { finished: false };
+  const r = await withRotateLockAsync(d, () => finishLocked(d));
+  if (r === BUSY) throw new Error("A key rotation is under way. Try again in a moment. Nothing was changed.");
+  return r;
+}
+
+async function finishLocked(d: string): Promise<{ finished: boolean; previous_keyid?: string }> {
+  const file = path.join(d, PREVIOUS_KEY_FILE);
+  sweepPreviousTmp(d); // a copy left by a rotation cut short goes too (Codex K.2)
+  if (!fs.lstatSync(file, { throwIfNoEntry: false })) return { finished: false };
+  let keyid: string | undefined;
+  try {
+    const s = inspectKeyFile(PREVIOUS_KEY_FILE, PREVIOUS);
+    if (s?.jwk) keyid = (await verifierFromJWK({ kty: "OKP", crv: "Ed25519", x: s.jwk.x })).keyid;
+  } catch {
+    // damaged: removed all the same (that is the fix the error message names)
+  }
+  rmRegular(file);
+  if (fs.lstatSync(file, { throwIfNoEntry: false })) throw new Error(`${file} is not a plain file, so it was not removed. Look at it yourself.`);
+  return { finished: true, ...(keyid ? { previous_keyid: keyid } : {}) };
 }
 
 // ---- W-05: the slip key ----
@@ -394,4 +665,114 @@ export function ensureSlipKey(): SlipKeys {
   const k = readSlipKey();
   if (!k) throw new SlipError("The slip key could not be made.");
   return k;
+}
+
+// ---- v1.1 workstream 4: rotating the slip key ----
+// The slip key signs permission slips, their use files and saved-page manifests (saved.ts). Replacing it makes
+// every existing slip fail its signature check, so slips.rotateSlipKey revokes them all first (and again after,
+// for any granted meanwhile). The old key's PUBLIC half is kept in keys/slips.retired.json, so `saved verify` can
+// still check snapshots signed before the rotation and say which key signed them. A retired key never checks a
+// slip. The private half is gone with the old file.
+export const SLIP_RETIRED_FILE = "slips.retired.json";
+// Every retired public half is kept (each is under 100 bytes); none is ever dropped (Codex K.5). The caps only stop a
+// planted giant file; a rotation that would pass them is refused before anything changes.
+const MAX_RETIRED = 100_000;
+const MAX_RETIRED_BYTES = 16 * 1024 * 1024;
+export const SLIP_ROTATE_LOCK = "slips.rotate"; // keys/slips.rotate.lock
+const X_RE = /^[A-Za-z0-9_-]{43}$/;
+export interface RetiredSlipKey {
+  x: string;
+  retired_at: string;
+}
+
+// The retired public halves, oldest first. Absent file: none. Anything else wrong is a SlipError.
+function readRetired(): RetiredSlipKey[] {
+  const d = keysDir(false);
+  if (!d) return [];
+  const file = path.join(d, SLIP_RETIRED_FILE);
+  let fd: number;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | NOFOLLOW | NONBLOCK);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw new SlipError(`The list of retired slip keys cannot be opened (${(e as NodeJS.ErrnoException).code ?? "error"}).`);
+  }
+  try {
+    ownFile(fd, file);
+    const st = fs.fstatSync(fd);
+    if (st.size > MAX_RETIRED_BYTES) throw new SlipError("The list of retired slip keys is too large to be one of Tiresias's.");
+    let o: unknown;
+    try {
+      o = JSON.parse(fs.readFileSync(fd, "utf8"));
+    } catch {
+      throw new SlipError("The list of retired slip keys is damaged (not valid JSON). Look at keys/slips.retired.json.");
+    }
+    const keys = (o as { v?: unknown; keys?: unknown })?.keys;
+    if ((o as { v?: unknown })?.v !== 1 || !Array.isArray(keys) || keys.length > MAX_RETIRED) throw new SlipError("The list of retired slip keys is damaged. Look at keys/slips.retired.json.");
+    return keys.map((k) => {
+      const x = (k as RetiredSlipKey)?.x;
+      const at = (k as RetiredSlipKey)?.retired_at;
+      if (typeof x !== "string" || !X_RE.test(x) || typeof at !== "string" || Number.isNaN(Date.parse(at))) throw new SlipError("The list of retired slip keys is damaged. Look at keys/slips.retired.json.");
+      return { x, retired_at: at };
+    });
+  } catch (e) {
+    if (e instanceof SlipError) throw e;
+    throw new SlipError(`The list of retired slip keys cannot be used (${(e as Error).message.replace(/[\r\n]/g, " ").slice(0, 120)}).`);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// The retired slip keys as public key objects, newest first, for checking old saved pages only.
+export function retiredSlipKeys(): { pub: KeyObject; retired_at: string }[] {
+  return readRetired()
+    .reverse()
+    .map((k) => ({ pub: createPublicKey({ key: { kty: "OKP", crv: "Ed25519", x: k.x }, format: "jwk" }), retired_at: k.retired_at }));
+}
+
+// Put a new slip key in place of the old one. The old public half goes to the retired list FIRST, so a rotation cut
+// short never leaves a saved page that nothing can check. A slip key that cannot be read (damaged, readable by
+// others) is replaced all the same, without a retired entry: that is the fix. Callers (slips.rotateSlipKey) revoke
+// the slips and check the confirmation; this only swaps the key.
+export function replaceSlipKey(now = Date.now(), beforeSwap?: () => void): { had_key: boolean; retired: boolean } {
+  if (isPrivate()) throw new SlipError("Private mode: nothing is written, so the slip key is not rotated.");
+  const why = syncedFolderReason();
+  if (why) throw new SlipError(why.replace("your private signing key", "your private keys"));
+  const d = keysDir(true)!;
+  // One slip rotation at a time (Codex K.3): two at once could both retire the same old key, losing the middle one.
+  const r = withRotateLock(d, 1000, () => replaceSlipLocked(d, now, beforeSwap), SLIP_ROTATE_LOCK);
+  if (r === BUSY) throw new SlipError("Another slip key rotation is under way. Try again in a moment. Nothing was changed.");
+  return r;
+}
+
+function replaceSlipLocked(d: string, now: number, beforeSwap?: () => void): { had_key: boolean; retired: boolean } {
+  const file = path.join(d, SLIP_KEY_FILE);
+  const had = !!fs.lstatSync(file, { throwIfNoEntry: false });
+  let x: string | null = null;
+  try {
+    x = inspectKeyFile(SLIP_KEY_FILE, SLIP)?.jwk?.x ?? null;
+  } catch {
+    x = null; // unusable: replaced without a retired entry
+  }
+  let body: Buffer | null = null;
+  if (x) {
+    const list = readRetired().filter((k) => k.x !== x);
+    list.push({ x, retired_at: new Date(now).toISOString() });
+    body = Buffer.from(JSON.stringify({ v: 1, keys: list }) + "\n");
+    if (list.length > MAX_RETIRED || body.length > MAX_RETIRED_BYTES)
+      throw new SlipError(`The list of retired slip keys is full (${MAX_RETIRED.toLocaleString("en-US")} keys). Rotating again would drop a key that old saved pages need, so it is refused. Nothing was changed.`);
+  }
+  // Every refusal is above this line: only now do the callers' irreversible steps (revoking the slips) run (Codex K.4).
+  beforeSwap?.();
+  // Looked at again just before the swap: the key being retired must still be the current one.
+  let again: string | null = null;
+  try {
+    again = inspectKeyFile(SLIP_KEY_FILE, SLIP)?.jwk?.x ?? null;
+  } catch {
+    again = null;
+  }
+  if (again !== x) throw new SlipError("The slip key changed while rotating. Nothing was replaced. Run the rotation again.");
+  if (body) writeSecret(path.join(d, SLIP_RETIRED_FILE), body, "replace");
+  writeSecret(file, newKeyBody().body, "replace");
+  return { had_key: had, retired: !!x };
 }

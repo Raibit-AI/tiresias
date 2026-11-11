@@ -2,11 +2,12 @@
 // W-13: the daily log. A readable page for one day, built from history.jsonl
 // (and receipts.jsonl) on request. It is never stored as a second copy; the
 // only file it can create is an export the owner asks for with --to.
+import { textView } from "./textview.js";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { HistoryEntry } from "./history.js";
-import { homeDir, isPrivate, listLogs, localDay, pageLog, randomTmp, utcDay } from "./store.js";
+import { homeDir, isPrivate, listLogs, localDay, pageLog, randomTmp, utcDay, type LogScan } from "./store.js";
 import { jsonBytes } from "./types.js";
 
 const PAGE_BUDGET = 40_000; // same size as history and receipts pages
@@ -59,6 +60,9 @@ function outcome(e: HistoryEntry): string {
 
 // One settings change in plain words, from the record's fixed codes (history.ts keeps only known codes).
 function settingWords(e: HistoryEntry): string {
+  const by0 = e.by === "terminal" ? "from a terminal (likely a person)" : e.by === "not_terminal" ? "NOT from a terminal (an agent, a script or cron)" : "by an unknown caller";
+  if (e.tool === "keys")
+    return `${e.event === "slip_key_rotated" ? `slip key rotated${e.revoked !== undefined ? `, ${e.revoked} slip${e.revoked === 1 ? "" : "s"} revoked` : ""}` : e.event === "signing_key_rotation_finished" ? "signing key rotation finished (previous key dropped)" : "signing key rotated"}, ${by0}`;
   const what =
     e.change === "never_ask" ? "confirmations for risky settings turned OFF (never ask again)"
     : e.change === "ask_again" ? "confirmations for risky settings turned back on"
@@ -73,7 +77,8 @@ const hhmm = (iso: string) => {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 };
 
-export async function buildLog(dayText?: string): Promise<LogDay> {
+export async function buildLog(dayText?: string, scan: LogScan = {}): Promise<LogDay> {
+  scan = { ...scan, deadline: scan.deadline ?? Date.now() + 60_000 };
   const { day, start, end } = parseDay(dayText);
   const entries: HistoryEntry[] = [];
   const changes: HistoryEntry[] = []; // W-32 (v0.9): risky settings changed this day get their own section, not counted as lookups
@@ -102,7 +107,8 @@ export async function buildLog(dayText?: string): Promise<LogDay> {
       }
       return false;
     }
-    if (e.tool === "settings") {
+    if (e.tool === "settings" || e.tool === "keys") {
+      // v1.1: a key rotation is listed with the settings changes (it is just as risky)
       changeCount++;
       if (changes.length < MAX_LOG_LOOKUPS) changes.push(e);
       return false;
@@ -114,7 +120,7 @@ export async function buildLog(dayText?: string): Promise<LogDay> {
     else otherAgents++;
     results.set(outcome(e), (results.get(outcome(e)) ?? 0) + 1); // a fixed set of outcomes
     return false;
-  });
+  }, 1, PAGE_BUDGET, scan);
   entries.sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
   changes.sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
   const perUrl = new Map<string, number>();
@@ -134,7 +140,7 @@ export async function buildLog(dayText?: string): Promise<LogDay> {
       }
     }
     return false;
-  });
+  }, 1, PAGE_BUDGET, scan);
 
   const link = (name: string) => `[${name}](${pathToFileURL(path.join(homeDir(), name)).href})`;
   const days = [...utcDays].sort().join(", ");
@@ -223,7 +229,7 @@ export async function exportLog(folder: string, dayText?: string): Promise<{ fil
   if (isPrivate()) throw new Error("Private mode: nothing is written, so the log is not exported. Run it without --to to print it.");
   // 1. Build the whole text first. Nothing on disk is touched until it exists.
   const log = await buildLog(dayText);
-  const body = fullText(log);
+  const body = textView(fullText(log));
   // 2. Resolve the folder ONCE and use only that real path from here on.
   let real: string;
   try {

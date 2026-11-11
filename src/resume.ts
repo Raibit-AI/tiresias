@@ -34,6 +34,7 @@ export interface Provided {
 // response decides what it is (its first bytes, then its file name); a file that is not a page is a file
 // warning, fingerprinted like a download.
 export async function fromPerson(t: handoffs.Ticket, p: Provided, opts: Opts, meta: CallMeta, agent?: string): Promise<Envelope> {
+  const source = p.file !== undefined ? "provided_by_person" : "provided_by_agent";
   const cap = fetchCap();
   if (p.text !== undefined && p.file !== undefined) throw new ProvidedError("Give the page as text or as a file, not both.");
   let src: Source;
@@ -65,7 +66,7 @@ export async function fromPerson(t: handoffs.Ticket, p: Provided, opts: Opts, me
       const f = hashPieces(v.file, v.flags, name, src);
       close();
       close = () => {};
-      return await fileWarning(t.url, t.url, f, meta, agent, "provided_by_person", opts);
+      return await fileWarning(t.url, t.url, f, meta, agent, source, opts);
     }
   } finally {
     close();
@@ -78,7 +79,7 @@ export async function fromPerson(t: handoffs.Ticket, p: Provided, opts: Opts, me
   const { parsed, wall } = await parsePage(k, body, k === "pdf" ? raw : undefined, t.url, v.flags, looksHtml(null, body));
   throwIfCancelled();
   if (wall)
-    return env(t.url, "wall", { message: STILL_WALLED, handoff: { reason: wall.code, explanation: wall.explanation }, uc: { handoff: { open_this: t.open_this ?? t.url } } });
+    return env(t.url, "wall", { message: source === "provided_by_agent" ? "The page the agent provided still shows a wall. The ticket stays open for a person." : STILL_WALLED, handoff: { reason: wall.code, explanation: wall.explanation }, uc: { handoff: { open_this: t.open_this ?? t.url } } });
   let door: Door = "text";
   let detail: CacheEntry["door_detail"] = detailOf(k);
   if (k === "html" && parsed.structured_count) {
@@ -89,10 +90,10 @@ export async function fromPerson(t: handoffs.Ticket, p: Provided, opts: Opts, me
   // The receipt URL is the ticket's URL; the entry exists only in memory and is never saved.
   const entry: CacheEntry = {
     parser: PARSER_VERSION, url: t.url, source_url: t.url, final_url: t.url, door, door_detail: detail, hash: "", content_type: "",
-    fetched_at: now, checked_at: now, parsed, source: "provided_by_person",
+    fetched_at: now, checked_at: now, parsed, source,
   };
   const out = await finishPage("read", t.url, entry, false, null, opts, null, now, () => {}, meta, { fresh: false });
-  if (out.status === "ok") out.message = `${PROVIDED}${out.message ? " " + out.message : ""}`;
+  if (out.status === "ok") out.message = `${source === "provided_by_agent" ? "Read from text an agent provided. Tiresias sent no request to the site for it. It was not cached or compared for changes." : PROVIDED}${out.message ? " " + out.message : ""}`;
   return out;
 }
 
@@ -128,13 +129,14 @@ export async function resume(id: string, provided?: Provided, ctx: Ctx = DEFAULT
   try {
     const opts: Opts = { question: ticket.question, section: ticket.section, render: ticket.render, translate: ticket.translate };
     const person = !!provided && (provided.text !== undefined || provided.file !== undefined);
-    const meta: CallMeta = person ? { source: "provided_by_person" } : {};
+    const source = provided?.file !== undefined ? "provided_by_person" : "provided_by_agent";
+    const meta: CallMeta = person ? { source } : {};
     out = await guarded(
       "resume", ticket.url, ctx, ticket.question,
       (m) => (person ? fromPerson(ticket, provided!, opts, m, ctx.agent) : run("read", ticket.url, { ...opts, fresh: true }, m, ctx.agent)),
       meta, { existing: ticket.id }, !person,
     );
-    if (person) out.source = "provided_by_person";
+    if (person) out.source = source;
     solved = out.status === "ok" || (!person && out.status === "unchanged");
   } finally {
     try {

@@ -7,7 +7,7 @@ import type http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
-import { freshHome, html, serve, text, type TestServer } from "./helper.js";
+import { freshHome, html, neverAsk, serve, text, timing, type TestServer } from "./helper.js";
 
 const FAKE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "tiresias-v051-home-"));
 process.env.HOME = FAKE_HOME;
@@ -1276,15 +1276,43 @@ test("round 75: one answer at a time across processes; no shared write without t
   const release = await hosts.acquireActive("https://two.example", new AbortController().signal);
   // Another process asking now waits until the first answer is read.
   const mod = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "hosts.js");
-  const child = new Promise<number>((resolve) => {
-    const c = spawn(process.execPath, ["--input-type=module", "-e", `const h = await import(${JSON.stringify(mod)}); const t = Date.now(); const r = await h.acquireActive("https://two.example", new AbortController().signal); console.log(Date.now() - t); r();`], { env: process.env });
-    let o = "";
-    c.stdout.on("data", (d) => (o += d));
-    c.on("close", () => resolve(Number(o.trim())));
+  const c = spawn(process.execPath, ["--input-type=module", "-e", `
+    const h = await import(${JSON.stringify(mod)});
+    const t = Date.now();
+    const pending = h.acquireActive("https://two.example", new AbortController().signal);
+    process.send({ type: "asking" });
+    const r = await pending;
+    process.send({ type: "acquired", waited: Date.now() - t });
+    r();
+    process.disconnect();
+  `], { env: process.env, stdio: ["ignore", "pipe", "pipe", "ipc"] });
+  let acquired = false;
+  let waited = 0;
+  let stderr = "";
+  c.stderr!.on("data", (d) => { stderr += d; });
+  const asking = new Promise<void>((resolve, reject) => {
+    c.on("message", (m: any) => {
+      if (m.type === "asking") resolve();
+      if (m.type === "acquired") { acquired = true; waited = m.waited; }
+    });
+    c.once("error", reject);
+    c.once("close", () => reject(new Error(`child exited before asking: ${stderr}`)));
   });
-  await new Promise((r) => setTimeout(r, 600));
-  release();
-  assert.ok((await child) >= 400, "the other process waited for the answer");
+  const exited = new Promise<number | null>((resolve) => c.once("close", resolve));
+  try {
+    // Start the hold ONLY after this process has imported hosts and actually called acquireActive.
+    // Startup can take arbitrarily long under load without consuming any of this hold.
+    await asking;
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(acquired, false, "the other process must not acquire while the first answer is held");
+    release();
+    assert.equal(await exited, 0, stderr);
+    assert.equal(acquired, true, "the other process must acquire after the answer is released");
+    timing(waited >= 400, `the ready child waited only ${waited} ms for the answer`);
+  } finally {
+    release();
+    c.kill();
+  }
   // A held lock: reserve does not write the file, and stays clear of the holder.
   const dir = path.join(home(), "hosts");
   const file = fs.readdirSync(dir).find((n) => !n.includes("."))!;
@@ -1344,8 +1372,11 @@ test("round 76: challenge frames are markers on their own; an object's address i
   assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
 });
 
-test("round 76: private calls never remove a stale lease; stale recovery is locked; the lease comes before the slot", async () => {
+test("round 76: unshared private calls leave no trace; shared calls write only spacing; stale recovery is locked; the lease comes before the slot", async () => {
   const h = freshHome();
+  neverAsk(h);
+  const config = path.join(h, "config.json");
+  fs.writeFileSync(config, JSON.stringify({ private_spacing: "none" }));
   const hosts = await import("../hosts.js");
   const store = await import("../store.js");
   hosts.reserve("https://stale.example", 0, 0);
@@ -1357,6 +1388,19 @@ test("round 76: private calls never remove a stale lease; stale recovery is lock
   const r = await store.runPrivate(() => hosts.acquireActive("https://stale.example", new AbortController().signal));
   r();
   assert.ok(fs.existsSync(active), "a private call leaves the store as it found it");
+  const before = fs.readFileSync(path.join(dir, base), "utf8");
+  store.runPrivate(() => hosts.reserve("https://stale.example", 1000, 0));
+  assert.equal(fs.readFileSync(path.join(dir, base), "utf8"), before, "unshared private spacing writes nothing");
+  fs.rmSync(config); // default shared spacing: only the origin's spacing file remains after the call
+  await store.runPrivate(async () => {
+    const release = await hosts.acquireActive("https://stale.example", new AbortController().signal);
+    try { hosts.reserve("https://stale.example", 1000, 0); } finally { release(); }
+  });
+  assert.deepEqual(fs.readdirSync(dir), [base]);
+  assert.deepEqual(fs.readdirSync(h).sort(), ["confirmations.json", "hosts"]);
+  const spacing = JSON.parse(fs.readFileSync(path.join(dir, base), "utf8"));
+  assert.deepEqual(Object.keys(spacing).sort(), ["last", "next", "v"]);
+  fs.writeFileSync(active, JSON.stringify({ v: 1, pid: 999_999, time: 0 }));
   // While another process holds the site lock, a stale lease is not broken by this one.
   fs.writeFileSync(path.join(dir, base + ".lock"), "");
   const ctl = new AbortController();
@@ -1389,6 +1433,8 @@ test("round 76: links inside <pre> are collected with their markers; paragraphs 
 
 test("round 77: only a writer recovers a lease; the first request makes hosts/ and holds its lease; live queues are never evicted; JSON-LD is pretty-printed", async () => {
   const h = freshHome();
+  neverAsk(h);
+  fs.writeFileSync(path.join(h, "config.json"), JSON.stringify({ private_spacing: "none" }));
   const hosts = await import("../hosts.js");
   const store = await import("../store.js");
   // the first request to a site in a fresh store holds a lease
@@ -1424,7 +1470,9 @@ test("round 77: only a writer recovers a lease; the first request makes hosts/ a
 // ---- Codex round 78 ----
 
 test("round 78: a cancelled waiter never drops a queue in use; spacing outlives 1,000 other sites; JSON-LD printing is bounded", async () => {
-  freshHome();
+  const h = freshHome();
+  neverAsk(h);
+  fs.writeFileSync(path.join(h, "config.json"), JSON.stringify({ private_spacing: "none" }));
   const queue = await import("../queue.js");
   const store = await import("../store.js");
   const run = <T>(f: () => Promise<T>) => store.runPrivate(f);
@@ -1440,11 +1488,13 @@ test("round 78: a cancelled waiter never drops a queue in use; spacing outlives 
   relA();
   (await c)();
   // spacing: one site, then 1,000 others, then the first again: the 1-second spacing still holds
-  await run(async () => (await queue.throttle("https://spaced.example", 1, new AbortController().signal, "x"))());
-  for (let i = 0; i < 1000; i++) await run(async () => (await queue.throttle(`https://o${i}.example`, 0, new AbortController().signal, "x"))());
   const t0 = Date.now();
   await run(async () => (await queue.throttle("https://spaced.example", 1, new AbortController().signal, "x"))());
-  assert.ok(Date.now() - t0 >= 300, `waited ${Date.now() - t0} ms`);
+  for (let i = 0; i < 1000; i++) await run(async () => (await queue.throttle(`https://o${i}.example`, 0, new AbortController().signal, "x"))());
+  await run(async () => (await queue.throttle("https://spaced.example", 1, new AbortController().signal, "x"))());
+  // Measured from before the first request, so the bound does not depend on how long the 1,000 others took
+  // (a slow CI machine once left 292 ms of the wait, under the 300 this used to ask for after the loop).
+  assert.ok(Date.now() - t0 >= 950, `the second request came ${Date.now() - t0} ms after the first`);
   // JSON-LD whose printed form would explode stays raw (bounded printer)
   const { parseHtml } = await import("../reader.js");
   let deep: unknown = Array(2000).fill(0);

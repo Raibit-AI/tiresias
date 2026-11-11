@@ -11,6 +11,7 @@
 //     page is rendered, no font is installed (disableFontFace)
 //   - pdf.js runs its own "worker" as ordinary code inside this thread (it has no separate thread in
 //     Node), so nothing is spawned outside our sandbox
+import { holdsSecret, SecretWithheld, type Secrets } from "./echo.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PdfError } from "./errors.js";
@@ -109,7 +110,7 @@ async function drawnText(page: { getOperatorList(): Promise<{ fnArray: number[];
   }
 }
 
-export async function parsePdf(bytes: Uint8Array, baseUrl: string): Promise<ParsedPage> {
+export async function parsePdf(bytes: Uint8Array, baseUrl: string, secrets?: Secrets): Promise<ParsedPage> {
   return quietly(async () => {
     const pdfjs = await import(PDFJS);
     const dir = packageDir();
@@ -154,6 +155,7 @@ export async function parsePdf(bytes: Uint8Array, baseUrl: string): Promise<Pars
       } catch {
         // no usable metadata
       }
+      if (holdsSecret([title], secrets)) throw new SecretWithheld();
       const pages: string[] = [];
       const hidden: { page: number; reason: string; text: string }[] = [];
       let kept = 0;

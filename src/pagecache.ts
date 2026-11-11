@@ -34,7 +34,7 @@ export interface CacheEntry extends Freshness {
   // Recorded from the fetch itself; fresh reuse needs `false` (Codex round 39).
   redirected?: boolean;
   // W-06: set only on the in-memory entry for a page a person provided. Such an entry is never saved.
-  source?: "provided_by_person";
+  source?: "provided_by_person" | "provided_by_agent";
   // W-10 (v0.7): `parsed` was read from the page as Chrome rendered it (its JavaScript run), not from the plain body.
   rendered?: true;
   render_hash?: string; // W-10: the fingerprint of the rendered HTML

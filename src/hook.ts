@@ -7,6 +7,7 @@
 // answered, or within 200 ms of Tiresias being gone. Tiresias also kills the group at the cap, on cancellation
 // and once it has the answer, so a hook that starts helpers leaves nothing running. Its output is capped; its
 // standard error is ignored. Hooks are never run on Windows (no process groups to kill).
+import { loadChoice } from "./config.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { currentSignal } from "./safety.js";
@@ -46,6 +47,7 @@ export function runHook(command: string[], extra: string[], timeoutMs: number, m
       const cap = maxOut === 4096 ? [] : [`max=${maxOut}`]; // the runner's default is the scanner's 4 KB
       child = spawn(process.execPath, [runner, String(process.pid), String(timeoutMs), ...cap, command[0], ...command.slice(1), ...extra], {
         // Always its own group: the runner kills its WHOLE group, which must never be ours.
+        env: loadChoice("hook_secrets") === "inherit" ? { ...process.env } : Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^TIRESIAS_.*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)/i.test(k))),
         shell: false, stdio: ["pipe", "pipe", "ignore"], detached: true, windowsHide: true,
       });
     } catch {

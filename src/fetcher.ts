@@ -49,6 +49,10 @@ async function politeFetchHeld(url: string, opts: SafeFetchOptions, turn: Turns)
     onHeaders: (hop) => {
       // Record the wait the moment 429/503 headers arrive, even if the body never finishes.
       if (hop.status === 429 || hop.status === 503) setCooldown(hop.url.origin, hop.status, hop.headers.get("retry-after"));
+      if (hop.redirect && hop.headers.has("retry-after")) {
+        const seconds = setCooldown(hop.url.origin, hop.status, hop.headers.get("retry-after"));
+        if (seconds > 0) throw new Refused(COOLDOWN_TEXT, undefined, seconds, hop.url.href);
+      }
       // A challenge (cf-mitigated) on ANY hop is a wall at that hop: a redirect is not
       // followed, and a 304 is not accepted as a revalidation. Plain 401/402/403 final
       // responses are handled with their body by the engine.

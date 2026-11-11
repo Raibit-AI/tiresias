@@ -16,6 +16,7 @@ import * as needs from "./needs.js";
 import * as slips from "./slips.js";
 import * as safebrowsing from "./safebrowsing.js";
 import { NOTICE, type Ctx } from "./types.js";
+import type { LogScan } from "./store.js";
 
 import { DEFAULT, Opts, guarded } from "./envelope.js";
 import { addSaved, doorsOnly, len, paginate, run } from "./pipeline.js";
@@ -86,13 +87,13 @@ export const claimSlip = slips.claimSlip;
 export const checkSlip = slips.checkSlip;
 
 export const queryHistory = history.query;
-export const dailyLog = async (day?: string, page = 1) => {
-  const log = await dailylog.buildLog(day);
+export const dailyLog = async (day?: string, page = 1, scan: LogScan = {}) => {
+  const log = await dailylog.buildLog(day, scan);
   return { day: log.day, entries: log.entries, ...dailylog.pageOf(log, page) };
 };
 export const exportDailyLog = dailylog.exportLog;
 // W-12: generated from the history when asked, never stored.
-export const needsReport = (since?: string, page = 1) => needs.buildNeeds(since, page);
+export const needsReport = (since?: string, page = 1, scan: LogScan = {}) => needs.buildNeeds(since, page, Date.now(), scan);
 // W-19: tiresias safety status | update.
 export const safetyStatus = safebrowsing.status;
 export const safetyUpdate = safebrowsing.update;

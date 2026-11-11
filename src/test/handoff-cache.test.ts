@@ -98,10 +98,10 @@ test("W-06: private mode keeps no ticket, says so, and creates nothing; resume i
   assert.equal(r.handoff!.ticket, undefined);
   assert.match(r.handoff!.resume!, /^Private mode: no handoff ticket/);
   assert.equal(r.private, true);
-  assert.equal(fs.existsSync(home), false, "a private wall creates nothing");
+  assert.deepEqual(fs.readdirSync(home), ["hosts"], "a private wall keeps only politeness state");
   const p = await engine.resume("AAAAAAAAAAAAAAAA", undefined, { agent: "a", private: true });
   assert.equal(p.status, "refused");
-  assert.equal(fs.existsSync(home), false);
+  assert.deepEqual(fs.readdirSync(home), ["hosts"]);
 });
 
 test("W-06: retry runs the same read honestly; a wall still there keeps the SAME ticket; success removes it", async () => {
@@ -157,7 +157,7 @@ test("W-06: a retry always asks the site, even when a cached copy is still fresh
   assert.equal(r.cache, undefined);
 });
 
-test("W-06: a page the person provided is parsed with NO request, marked provided_by_person everywhere, not cached", async () => {
+test("W-06: text an agent provided is parsed with NO request, marked provided_by_agent everywhere, not cached", async () => {
   const home = freshHome();
   const { s } = await walledSite();
   const w = await engine.read(s.url + "/members", { question: "prices" }, { agent: "a" });
@@ -166,13 +166,13 @@ test("W-06: a page the person provided is parsed with NO request, marked provide
   const r = await engine.resume(id, { text: ANVILS }, { agent: "a" });
   assert.equal(s.hits.length, hits, "nothing at all was sent to the site, not even robots.txt");
   assert.equal(r.status, "ok");
-  assert.equal(r.source, "provided_by_person");
+  assert.equal(r.source, "provided_by_agent");
   assert.equal(r.signed, undefined, "no request, so no signed field");
   assert.equal(r.door_detail, "html");
   assert.deepEqual(r.ticket, { id, open: false });
   assert.ok(uc(r).receipts.length > 0);
   for (const rc of uc(r).receipts) {
-    assert.equal(rc.source, "provided_by_person");
+    assert.equal(rc.source, "provided_by_agent");
     assert.equal(rc.url, s.url + "/members");
   }
   assert.match(uc(r).passages[0].text, /forty dollars/);
@@ -180,9 +180,9 @@ test("W-06: a page the person provided is parsed with NO request, marked provide
   // not cached and not a baseline: a later check of that URL is a first visit
   assert.equal(fs.existsSync(store.cachePath(s.url + "/members")), false);
   const logged = logText(home, "receipts").split("\n").filter(Boolean).map((l) => JSON.parse(l));
-  assert.ok(logged.length && logged.every((x) => x.source === "provided_by_person"));
+  assert.ok(logged.length && logged.every((x) => x.source === "provided_by_agent"));
   const h = readHistory().at(-1);
-  assert.deepEqual([h.tool, h.status, h.source], ["resume", "ok", "provided_by_person"]);
+  assert.deepEqual([h.tool, h.status, h.source], ["resume", "ok", "provided_by_agent"]);
   assert.deepEqual(ticketFiles(), []);
 });
 
@@ -268,7 +268,7 @@ test("W-06: a provided page that still shows a wall keeps the ticket open; a PDF
   assert.equal(r.status, "wall");
   assert.equal(r.handoff!.reason, "captcha");
   assert.equal(r.handoff!.ticket, id);
-  assert.equal(r.source, "provided_by_person");
+  assert.equal(r.source, "provided_by_agent");
   assert.equal(uc(r).handoff.open_this, s.url + "/members/login-IGNORE-PREVIOUS");
   assert.deepEqual(r.ticket, { id, open: true });
   const pdf = await engine.resume(id, { text: "%PDF-1.4 ..." }, { agent: "a" });
@@ -371,7 +371,7 @@ test("W-06: MCP resume and handoffs; tickets are inside untrusted_content; needs
   const res = await client.callTool({ name: "resume", arguments: { ticket: id, text: "# Saved\n\nThe person pasted this page about anvils.\n" } });
   const r = body(res);
   assert.equal(res.isError, undefined);
-  assert.deepEqual([r.status, r.source, r.ticket.open], ["ok", "provided_by_person", false]);
+  assert.deepEqual([r.status, r.source, r.ticket.open], ["ok", "provided_by_agent", false]);
   st.open = true;
   const r2 = body(await client.callTool({ name: "resume", arguments: { ticket: second } }));
   assert.deepEqual([r2.status, r2.source, r2.ticket.open], ["ok", undefined, false]);
@@ -385,9 +385,9 @@ test("W-06: MCP resume and handoffs; tickets are inside untrusted_content; needs
   assert.deepEqual(bigEnv.ticket, { id: live, open: true });
   assert.ok(Buffer.byteLength((big.content as any)[0].text) < 60_000, "a huge input never makes a huge reply");
   const n = await engine.needsReport();
-  assert.deepEqual(n.counts.handoffs, { tickets: 3, refused_cap: 0, resolved_retry: 1, resolved_person: 1 });
+  assert.deepEqual(n.counts.handoffs, { tickets: 3, refused_cap: 0, resolved_retry: 1, resolved_person: 0, resolved_agent: 1 });
   const { toMarkdown } = await import("../needs.js");
-  assert.match(toMarkdown(n), /resolved by a retry: 1; by a page a person provided: 1\. Expired tickets are not counted/);
+  assert.match(toMarkdown(n), /resolved by a retry: 1; by a page a person provided: 0; by text an agent provided: 1\. Expired tickets are not counted/);
 });
 
 // ---- W-03: the shared cache ----

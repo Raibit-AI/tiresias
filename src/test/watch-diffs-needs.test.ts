@@ -626,7 +626,7 @@ test("W-16: watch checks watched bookmarks only, reports only the changed, and c
   assert.deepEqual(first.counts, { watched: 5, checked: 5, changed: 0, unchanged: 0, no_baseline: 2, walled: 1, failed: 2, skipped_cooldown: 0, not_run: 0, receipts: 0, changes_trimmed: 0, file_warnings: 0, attention_omitted: 0, attention_urls_omitted: 0 });
   assert.equal(first.untrusted_content!.changed, undefined);
   // the ones a person may need to act on are named, with fixed codes; URLs stay inside untrusted_content
-  assert.deepEqual(first.attention, [
+  assert.deepEqual(first.untrusted_content!.attention!, [
     { name: "robots-no", outcome: "failed", status: "refused" },
     { name: "slow", outcome: "failed", status: "error", retry_after_seconds: 3600 },
     { name: "walled", outcome: "walled", status: "wall", reason: "forbidden" },
@@ -638,11 +638,11 @@ test("W-16: watch checks watched bookmarks only, reports only the changed, and c
   news = doc("News", [["Today", ["Sun."]]]);
   const second = await engine.watch({ agent: "cron" });
   assert.deepEqual(second.counts, { watched: 5, checked: 5, changed: 1, unchanged: 1, no_baseline: 0, walled: 1, failed: 1, skipped_cooldown: 1, not_run: 0, receipts: 1, changes_trimmed: 0, file_warnings: 0, attention_omitted: 0, attention_urls_omitted: 0 });
-  const waiting = second.attention.find((a) => a.name === "slow")!;
+  const waiting = second.untrusted_content!.attention!.find((a) => a.name === "slow")!;
   assert.equal(waiting.outcome, "waiting");
   assert.equal(waiting.status, "refused");
   assert.ok(waiting.retry_after_seconds! > 3500 && waiting.retry_after_seconds! <= 3600);
-  assert.deepEqual(second.attention.map((a) => a.name), ["robots-no", "slow", "walled"], "unchanged and changed ones are not named here");
+  assert.deepEqual(second.untrusted_content!.attention!.map((a) => a.name), ["robots-no", "slow", "walled"], "unchanged and changed ones are not named here");
   const item = second.untrusted_content!.changed![0];
   assert.equal(item.name, "news");
   assert.deepEqual([item.added, item.removed], [1, 1]);
@@ -700,7 +700,7 @@ test("W-16: the attention list is bounded at 100 names and counts the rest", asy
   await engine.bookmark("remove", "seed");
   const r = await engine.watch();
   assert.equal(r.counts.walled, engine.WATCH_ATTENTION + 3);
-  assert.equal(r.attention.length, engine.WATCH_ATTENTION);
+  assert.equal(r.untrusted_content!.attention!.length, engine.WATCH_ATTENTION);
   assert.equal(r.untrusted_content!.attention_urls!.length, engine.WATCH_ATTENTION);
   assert.equal(r.counts.attention_omitted, 3);
 });
@@ -765,14 +765,14 @@ test("round 36 #2: long URLs and long wall targets never push a watch reply past
   const r = await engine.watch(undefined, 1);
   assert.equal(r.counts.walled, 10);
   assert.ok(JSON.stringify(r).length <= 60_000, `reply is ${JSON.stringify(r).length} characters`);
-  assert.equal(r.attention.length, 10, "every walled bookmark is still named");
+  assert.equal(r.untrusted_content!.attention!.length, 10, "every walled bookmark is still named");
   assert.ok(r.counts.attention_urls_omitted > 0);
   assert.equal(r.untrusted_content!.attention_urls!.length + r.counts.attention_urls_omitted, 10, "omitted URLs are counted");
   // the MCP reply is the report itself, not an oversize error
   const client = await connect();
   const m: any = await client.callTool({ name: "watch", arguments: {} });
   assert.notEqual(m.isError, true);
-  assert.equal(body(m).attention.length, 10);
+  assert.equal(body(m).untrusted_content.attention.length, 10);
   await client.close();
 });
 

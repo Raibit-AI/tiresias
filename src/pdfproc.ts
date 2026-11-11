@@ -9,6 +9,7 @@
 // page_too_complex and nothing is kept. FAIL CLOSED: if the memory of the child cannot be watched (Windows, no
 // `ps`, no /proc, or a probe that fails mid-way) PDFs are not read, with a clear message. The child has an empty environment, no shell, no stdin or
 // stdout, and is killed when this process exits.
+import { SecretWithheld } from "./echo.js";
 import { execFile, fork, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -18,6 +19,7 @@ import { currentSignal } from "./safety.js";
 import { PageTooComplex, budgetMs, workerHeapMb } from "./sandbox.js";
 import { MAX_PDF_RESULT_CHARS, type Done, type Job } from "./work.js";
 import { Slots } from "./slots.js";
+import { startParentWatchdog } from "./parentwatch.js";
 
 export const PDF_MEMORY_MB = 1024;
 const POLL_MS = 50;
@@ -36,7 +38,7 @@ const live = new Set<ChildProcess>();
 // v0.5.1: the child runs under Node's permission model. It may READ only Tiresias's own folder (dist/) and
 // the node_modules folder that holds pdfjs-dist (pdf.js, its fonts and cmaps, and the reader's own
 // dependencies installed beside it); it may write nothing, start no process and load no native add-on.
-// The one worker it may start is its parent watchdog (parentwatch.ts). So a PDF that took over the
+// Its watchdog runs outside the child (parentwatch.ts). So a PDF that took over the
 // parser still cannot read ~/.tiresias (the keys) or the owner's files. (Node 22's permission model does
 // not cover the network; the child is given no address and no code that fetches.)
 export const childExecArgv = (heap: number): string[] => [`--max-old-space-size=${heap}`, ...childPermissions()];
@@ -53,7 +55,7 @@ export function childPermissions(): string[] {
     }
   };
   const dirs = [...new Set([app, modules, real(app), real(modules)])];
-  return ["--permission", ...dirs.map((d) => `--allow-fs-read=${path.join(d, "*")}`), "--allow-worker"];
+  return ["--permission", ...dirs.map((d) => `--allow-fs-read=${path.join(d, "*")}`)];
 }
 export const activePdfPids = (): number[] => [...live].map((c) => c.pid!).filter(Boolean);
 // No child may outlive this process. (The child also exits when its IPC channel closes.)
@@ -141,6 +143,7 @@ function start<T>(job: Job): Promise<T> {
       serialization: "advanced",
     });
     live.add(child);
+    const watchdog = startParentWatchdog(child.pid!);
     child.stderr?.resume(); // drained and thrown away
     let settled = false;
     let polling = false;
@@ -153,6 +156,7 @@ function start<T>(job: Job): Promise<T> {
       clearInterval(poll);
       sig?.removeEventListener("abort", onAbort);
       child.kill("SIGKILL"); // the child is done or being thrown away; it never stays
+      watchdog.kill("SIGKILL");
       live.delete(child);
       fn();
     };
@@ -211,6 +215,7 @@ function start<T>(job: Job): Promise<T> {
           if (JSON.stringify(d.result).length > MAX_PDF_RESULT_CHARS) return tooComplex();
           return void accept(() => resolve(d.result as T), peakKb);
         }
+        if (d.error === "secret_withheld") return finish(() => reject(new SecretWithheld()));
         if (d.error === "pdf") {
           const msg = String(d.message ?? "This PDF could not be read.").slice(0, 300);
           return void accept(() => reject(new PdfError(msg)), peakKb);
@@ -220,12 +225,19 @@ function start<T>(job: Job): Promise<T> {
         tooComplex();
       }
     });
-    try {
-      child.send(job, (err) => {
-        if (err) tooComplex();
-      });
-    } catch {
-      tooComplex(); // a send that throws at once still goes through finish(): child, timers and listeners are cleaned up
-    }
+    watchdog.once("error", tooComplex);
+    watchdog.once("exit", () => {
+      if (!settled && !answered) tooComplex();
+    });
+    watchdog.once("message", () => {
+      if (settled) return;
+      try {
+        child.send(job, (err) => {
+          if (err) tooComplex();
+        });
+      } catch {
+        tooComplex(); // a send that throws still cleans up the child, timers and listeners
+      }
+    });
   });
 }

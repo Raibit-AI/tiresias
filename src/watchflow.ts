@@ -107,11 +107,10 @@ export interface WatchReport {
     attention_omitted: number; // walled, failed or waiting bookmarks past WATCH_ATTENTION (or the size budget), not named
     attention_urls_omitted: number; // named ones whose URLs did not fit the reply
   };
-  attention: WatchAttention[]; // the walled, failed and waiting bookmarks, by name
   page?: number;
   pages: number;
   // `attention_urls`: each named bookmark's URL and, for a wall, the exact page to open (web-derived).
-  untrusted_content: { changed?: WatchItem[]; receipts?: Receipt[]; attention_urls?: { name: string; url: string; open_this?: unknown }[] } | null;
+  untrusted_content: { attention?: WatchAttention[]; changed?: WatchItem[]; receipts?: Receipt[]; attention_urls?: { name: string; url: string; open_this?: unknown }[] } | null;
 }
 
 // W-16: check every watched bookmark, one after another, with the same rules as any check
@@ -219,7 +218,6 @@ export async function watch(ctx: Ctx = DEFAULT, page?: number): Promise<WatchRep
       : "No bookmarks are watched. Add one with bookmark add <name> <url> --watch.",
     notice: NOTICE,
     counts,
-    attention,
     ...(page === undefined ? {} : { page }),
     pages: page === undefined ? 1 : pages,
     untrusted_content: null,
@@ -229,7 +227,7 @@ export async function watch(ctx: Ctx = DEFAULT, page?: number): Promise<WatchRep
   const build = () => {
     const rs = rcpts.flat();
     report.counts.receipts = rs.length;
-    const uc = { ...(changed.length ? { changed } : {}), ...(rs.length ? { receipts: rs } : {}), ...(attentionUrls.length ? { attention_urls: attentionUrls } : {}) };
+    const uc = { ...(attention.length ? { attention } : {}), ...(changed.length ? { changed } : {}), ...(rs.length ? { receipts: rs } : {}), ...(attentionUrls.length ? { attention_urls: attentionUrls } : {}) };
     report.untrusted_content = Object.keys(uc).length ? uc : null;
   };
   build();

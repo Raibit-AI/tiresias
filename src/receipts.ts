@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // N-03: receipts. Every quote an agent gets back is also written to a local
 // log, so a human can later check exactly what was read, where, and when.
-import { appendLine, listLogs, pageLog, parseSince, utcDay, type LogPage } from "./store.js";
+import { appendLine, listLogs, pageLog, parseSince, utcDay, type LogPage, type LogScan } from "./store.js";
 import type { Receipt } from "./types.js";
 import { receiptFingerprint } from "./saved.js";
 
@@ -33,7 +33,7 @@ export function record(receipts: Receipt[]): void {
   }
 }
 
-export async function query(f: { url?: string; since?: string; page?: number }): Promise<LogPage<Receipt>> {
+export async function query(f: { url?: string; since?: string; page?: number }, scan: LogScan = {}): Promise<LogPage<Receipt>> {
   const since = parseSince(f.since);
   // The URL as typed, or as a URL parser writes it ("https://example.com" is recorded as "https://example.com/").
   let alt: string | undefined;
@@ -55,6 +55,7 @@ export async function query(f: { url?: string; since?: string; page?: number }):
       return true;
     },
     f.page ?? 1,
+    40_000, scan,
   );
 }
 
@@ -130,7 +131,7 @@ export interface FileRecord {
   declared_name?: string;
   scan?: string;
   agent: string;
-  source?: "provided_by_person";
+  source?: "provided_by_person" | "provided_by_agent";
   recorded_at: string;
   cut?: true;
 }

@@ -11,7 +11,7 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { parseSignatureAgent } from "./config.js";
-import { KEY_FILE } from "./keys.js";
+import { KEY_FILE, PREVIOUS_KEY_FILE } from "./keys.js";
 import {
   DEFAULT_PROFILE, NOFOLLOW, NONBLOCK, PROFILE_RE, ProfileError, checkProfileName, checkSub, ensureRoot, profileDir, profilesRoot, readOwnedFile, readRoot, rootDir,
 } from "./store.js";
@@ -135,7 +135,7 @@ function plan(dir: string): Plan {
       if (s.isDirectory()) stack.push(f);
       else if (s.isFile()) {
         p.files.push({ file: f, size: s.size });
-        if (rel === path.join("keys", KEY_FILE)) p.hasKey = true;
+        if (rel === path.join("keys", KEY_FILE) || rel === path.join("keys", PREVIOUS_KEY_FILE)) p.hasKey = true; // v1.1: a rotation's previous key is a private key too
       } else throw bad("something that is not a file or a folder");
     }
   }

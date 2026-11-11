@@ -294,7 +294,7 @@ test("cooldown log: the v0.1.3 JSON store is read (never written) and merged by 
   fs.rmSync(legacy);
 });
 
-test("cooldown log: only the last 8 MB is read, starting at the first full line", () => {
+test("cooldown log: live deadlines before the last 8 MB are still obeyed", () => {
   fs.rmSync(cur(), { force: true });
   const now = Date.now();
   const early = JSON.stringify({ origin: "http://too-early.test", until: now + 900_000 }) + "\n";
@@ -304,7 +304,7 @@ test("cooldown log: only the last 8 MB is read, starting at the first full line"
   fs.writeFileSync(cur(), body);
   assert.ok(fs.statSync(cur()).size > 8 * 1024 * 1024);
   assert.ok(cooldown.cooldownLeft("http://recent.test") > 800);
-  assert.equal(cooldown.cooldownLeft("http://too-early.test"), 0, "outside the 8 MB window, by design");
+  assert.ok(cooldown.cooldownLeft("http://too-early.test") > 800, "an active deadline is never forgotten");
   // the cut lands mid-line; the partial line must not be mistaken for a record
   const lines = store.readLogSync<any>("cooldowns.jsonl", 100);
   assert.ok(lines.every((l) => l && typeof l.origin === "string"));

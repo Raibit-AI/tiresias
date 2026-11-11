@@ -16,6 +16,8 @@
 // whole: more than 100 fields (too_many_fields), one visible name used by two different fields
 // (duplicate_names), a listing or a default value too large to show exactly (too_large).
 import { createHash } from "node:crypto";
+import { listsFor, stripAccents } from "./shieldphrases.js";
+import type { Lang } from "./lang.js";
 import { MAX_URL } from "./types.js";
 
 interface N {
@@ -57,9 +59,9 @@ const ORDER: NotAllowed[] = ["login_or_password", "captcha", "payment", "file_up
 export const NOT_ALLOWED_TEXT: Record<NotAllowed, string> = {
   unknown_control: "This form has a field of a kind Tiresias does not know (an input type outside the standard ones), so it does not send the form.",
   nested_control: "This form has a field inside another control (a button, a list of options, a template), which Tiresias cannot list or check as a field, so it does not send the form.",
-  login_or_password: "This form asks for a password or a login code. Tiresias never handles logins or passwords: a person has to sign in themselves.",
+  login_or_password: "This form asks for sign-in, a password or a login code. Tiresias never handles logins or passwords: a person has to sign in themselves.",
   file_upload: "This form uploads files (a file field or multipart encoding). Tiresias does not send files.",
-  payment: "This form looks like a payment form (card number, security code, expiry, IBAN or routing number). This version of Tiresias never pays.",
+  payment: "This form looks like a payment or purchase form (a payment action, card number, security code, expiry, IBAN or routing number). This version of Tiresias never pays.",
   captcha: "This form has a CAPTCHA or bot check. A person has to fill it in; Tiresias never solves one.",
   bad_action: "This form sends to something that is not an http or https address, so Tiresias does not use it.",
   bad_method: "This form uses a method other than GET or POST, so Tiresias does not use it.",
@@ -174,6 +176,10 @@ const cut = (s: string | undefined, n: number): string | undefined => {
   return t || undefined;
 };
 
+// Characters that render as nothing (zero-width, soft hyphen, bidi marks, variation selectors and the
+// like) are removed before any text is judged (round 90).
+const invisible = (t: string) => t.replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
+
 // THE text normalization of the form guard (round 93, one path for every text it judges): invisible and
 // format characters removed, NFKC (fullwidth letters, ligatures, compatibility digits), case-folded
 // (upper then lower, so "ß" is "ss" and the long s is "s"), invisible characters removed again.
@@ -190,13 +196,15 @@ const fold = (t: string) => invisible(invisible(t).normalize("NFKC").toUpperCase
 // Code" and "ArE YoU HuMaN" all contain their marker's run-together form, whatever the spacing,
 // punctuation or capitals. Built per attribute value and per block of inline-joined text.
 const skeleton = (text: string) => fold(text).replace(/[^a-z0-9]/g, "");
-function tokens(text: string): { words: string[]; chunks: string[] } {
+function tokens(text: string): { words: string[]; chunks: string[]; runs: string[][] } {
   const base = invisible(text).normalize("NFKC");
   const folded = fold(base);
   const camel = fold(base.replace(/(\p{Ll})(\p{Lu})/gu, "$1 $2"));
+  const runs = [folded, camel].map((s) => s.split(/[^a-z0-9]+/).filter(Boolean));
   return {
-    words: [...folded.split(/[^a-z0-9]+/), ...camel.split(/[^a-z0-9]+/)].filter(Boolean),
+    words: runs.flat(),
     chunks: folded.split(/\s+/).map((c) => c.replace(/[^a-z0-9]/g, "")).filter(Boolean),
+    runs,
   };
 }
 
@@ -234,8 +242,9 @@ export interface AuditContext {
   labelsFor: Map<string, N[]>; // every <label for=...> of the page, all of them per id
   ancestors: N[]; // the form's ancestors, innermost first
   span: Map<N, { a: number; z: number }>; // each node's document-order index and the last index inside it
+  texts: Map<string, JudgedText>; // page-local: shared by forms, never by pages or calls
 }
-// THE one list of markers, single words and phrases alike. A phrase also matches with its words run
+// The existing safety markers, single words and phrases alike. A phrase also matches with its words run
 // together in any way ("sign in code" is also "signin code", "sign incode" and "signincode").
 const MARKER_PHRASES: [NotAllowed, string[]][] = [
   ["payment", ["card number", "card num", "card no", "credit card", "debit card", "cc num", "cc number", "cc exp", "cc expiry", "cc csc", "cc cvv", "cc cvc",
@@ -243,6 +252,166 @@ const MARKER_PHRASES: [NotAllowed, string[]][] = [
   ["login_or_password", ["password", "pass code", "passphrase", "login code", "sign in code", "one time", "otp", "verification code", "2fa", "two factor", "authenticator", "pin code"]],
   ["captcha", ["captcha", "turnstile", "not a robot", "not robot", "are you a human", "are you human"]],
 ];
+// Actions use whole words only, never chunks or skeletons: "display", "buyer", "designing" and
+// "blog in" are ordinary text. Inflections are explicit so unrelated longer words stay harmless.
+const ACTION_WORDS: [NotAllowed, string[]][] = [
+  ["payment", ["pay", "pays", "paying", "paid", "payment", "payments", "purchase", "purchases", "purchased", "purchasing", "buy", "buys", "buying", "bought", "checkout", "checkouts", "placeorder"]],
+  ["login_or_password", ["login", "logins", "signin", "signins"]],
+];
+// Preserve the original ASCII-token phrase checks on every text that feeds the word bag,
+// including the whole subtree with text nodes spaced apart.
+const LEGACY_ACTION_PHRASES: [NotAllowed, string, string][] = [
+  ...["check", "checks", "checked", "checking"].map((w): [NotAllowed, string, string] => ["payment", w, "out"]),
+  ...["place", "places", "placed", "placing"].flatMap((w) => ["order", "orders"].map((o): [NotAllowed, string, string] => ["payment", w, o])),
+  ...["log", "logs", "logged", "logging", "sign", "signs", "signed", "signing"].map((w): [NotAllowed, string, string] => ["login_or_password", w, "in"]),
+];
+// New phrases require ordered Unicode words in one attribute or block, in either inline
+// tokenisation. Separate attributes or blocks cannot form a new phrase.
+const ACTION_PHRASES: [NotAllowed, string, string][] = [
+  ...LEGACY_ACTION_PHRASES,
+  ...["confirm", "confirms", "confirmed", "confirming", "complete", "completes", "completed", "completing",
+    "submit", "submits", "submitted", "submitting", "finish", "finishes", "finished", "finishing",
+    "finalize", "finalizes", "finalized", "finalizing", "finalise", "finalises", "finalised", "finalising"]
+    .flatMap((w) => ["order", "orders", "purchase", "purchases", "payment", "payments"].map((o): [NotAllowed, string, string] => ["payment", w, o])),
+  ["payment", "order", "now"],
+];
+// Script selects candidate lists, not a language identification. Only unambiguous vocabulary
+// matches anywhere. Ambiguous bare words require a complete submit-control text/value/alt,
+// optionally preceded or followed by that language's "now", with closed complements.
+// Explicit inflections only, no stemming.
+type ActionGroups = [login: string[], payment: string[]];
+interface OtherActions { anywhere: ActionGroups; submit: ActionGroups; now: string[] }
+// Closed, language-specific grammar; at most two of these may separate phrase parts.
+const FILLERS: Record<string, string[]> = {
+  en: ["your", "my", "the", "this", "our", "their", "me"],
+  es: ["mi", "tu", "su", "el", "la", "los", "las", "mis", "tus", "sus", "este", "esta"],
+  fr: ["ma", "mon", "mes", "votre", "vos", "notre", "nos", "la", "le", "les", "ce", "cette"],
+  de: ["meine", "meinen", "mein", "ihre", "ihren", "ihr", "die", "der", "das", "deine", "deinen", "dein"],
+  pt: ["meu", "minha", "seu", "sua", "o", "a", "os", "as", "este", "esta"],
+  it: ["mio", "mia", "tuo", "tua", "suo", "sua", "il", "lo", "la", "un", "una"],
+  nl: ["mijn", "je", "jouw", "uw", "de", "het", "dit", "deze"],
+  ru: ["мой", "моя", "мои", "мою", "ваш", "ваша", "ваши", "вашу", "свой", "свою", "этот"],
+  zh: ["我的", "您的", "你的"], ja: ["私の", "あなたの"], ko: ["내", "나의", "귀하의"],
+  ar: ["هذا", "هذه"], hi: ["मेरा", "मेरे", "अपना", "अपने", "आपका", "आपके", "की"],
+};
+// Only complete control labels accept these complements, never arbitrary trailing text.
+const COMPLEMENTS: Record<string, ActionGroups> = {
+  en: [["with email", "to account"], []], es: [["con email", "con correo", "a cuenta"], []],
+  fr: [["avec email", "par email", "a compte"], ["par carte"]],
+  de: [["mit email", "mit e mail", "in konto"], []], pt: [["com email", "com e mail", "na conta"], []],
+  it: [["con email", "con e mail", "al account"], []], nl: [["met email", "met e mail", "op account"], []],
+  ru: [["по почте", "в аккаунт"], []], ar: [["إلى حسابك", "الى حسابك", "بالبريد"], []],
+};
+const OTHER_ACTIONS: Record<Lang, OtherActions> = {
+  en: { anywhere: [[], []], submit: [["log in", "sign in"], ["order"]], now: ["now"] },
+  es: { anywhere: [["iniciar sesion", "inicia sesion", "inicie sesion"],
+    ["pagar", "pague", "comprar", "finalizar compra", "finalizar pedido", "realizar pedido", "hacer pedido", "confirmar pedido", "tramitar pedido"]],
+    submit: [["acceder", "accede", "acceda"], ["paga", "compra", "compre"]], now: ["ahora"] },
+  fr: { anywhere: [["se connecter", "me connecter", "connectez vous", "ouvrir une session"],
+    ["payez", "acheter", "achetez", "passer a la caisse", "passer commande", "valider la commande", "confirmer la commande"]],
+    submit: [["connexion"], ["payer", "achat", "commander"]], now: ["maintenant"] },
+  de: { anywhere: [["einloggen", "einloggen sie sich"],
+    ["bezahlen", "kaufen", "kaufe", "zur kasse", "bestellung aufgeben", "jetzt bestellen", "bestellung bestatigen"]],
+    submit: [["anmelden", "anmeldung"], ["zahlen", "kauf", "bestellen", "zahlungspflichtig bestellen"]], now: ["jetzt"] },
+  pt: { anywhere: [["iniciar sessao", "iniciar sessao de utilizador", "fazer login", "entrar na conta"],
+    ["pagar", "pague", "comprar", "finalizar compra", "finalizar pedido", "fazer pedido", "efetuar pedido", "confirmar pedido", "concluir pedido"]],
+    submit: [["entrar"], ["compre", "compra"]], now: ["agora"] },
+  it: { anywhere: [["effettua l accesso", "inizia sessione"],
+    ["pagare", "acquista", "acquistare", "acquisto", "comprare", "procedi al pagamento", "vai alla cassa", "effettua ordine", "effettua l ordine", "conferma ordine"]],
+    submit: [["accedi", "accedere"], ["paga", "compra", "ordina"]], now: ["ora", "adesso"] },
+  nl: { anywhere: [["inloggen", "log in", "meld je aan"],
+    ["betalen", "betaal", "kopen", "aankoop", "afrekenen", "bestelling plaatsen", "plaats bestelling", "bestelling bevestigen"]],
+    submit: [["aanmelden", "aanmelding"], ["koop", "bestel"]], now: ["nu"] },
+  ru: { anywhere: [["вход в систему", "авторизоваться"],
+    ["оплатить", "оплата", "платить", "купить", "покупка", "оформить покупку", "оформить заказ", "разместить заказ", "подтвердить заказ", "заказать"]],
+    submit: [["войти", "вход"], ["приобрести"]], now: ["сейчас"] },
+  zh: { anywhere: [["登录", "登錄", "登入"],
+    ["支付", "付款", "购买", "購買", "结账", "結帳", "結賬", "结算", "結算", "下单", "下單", "提交订单", "提交訂單", "确认订单", "確認訂單"]],
+    submit: [[], ["买", "買", "订购", "訂購"]], now: ["现在", "現在", "立即"] },
+  ja: { anywhere: [["ログイン", "サインイン"],
+    ["支払う", "支払い", "お支払", "購入", "買う", "チェックアウト", "レジに進む", "注文する", "注文を確定", "注文を送信", "注文確定", "注文を完了する"]],
+    submit: [[], []], now: ["今すぐ"] },
+  ko: { anywhere: [["로그인", "로그인하기"],
+    ["결제", "지불", "구매", "구입", "체크아웃", "주문하기", "주문 제출", "주문 확정", "주문 완료"]],
+    submit: [[], ["사기"]], now: ["지금"] },
+  ar: { anywhere: [["تسجيل الدخول", "تسجيل دخول"],
+    ["ادفع", "إدفع", "شراء", "اشتر", "اشتري", "اشترى", "إتمام الشراء", "اتمام الشراء", "تقديم الطلب", "إرسال الطلب", "ارسال الطلب", "تأكيد الطلب"]],
+    submit: [["الدخول"], ["دفع", "الدفع", "اطلب"]], now: ["الآن", "الان"] },
+  hi: { anywhere: [["साइन इन", "लॉग इन", "लाग इन", "लॉगिन", "प्रवेश करें"],
+    ["भुगतान", "खरीदें", "खरीदना", "खरीदारी", "चेकआउट", "चेक आउट", "ऑर्डर दें", "आर्डर दें", "ऑर्डर करें", "ऑर्डर पक्का करें", "ऑर्डर पुष्टि करें"]],
+    submit: [[], []], now: ["अभी"] },
+};
+const NO_ACTION_EDGES = new Set(["zh", "ja", "ko"]);
+const LATIN_ACTIONS = new Set(["es", "fr", "de", "pt", "it", "nl"]);
+const WORD_SEP = "[^\\p{L}\\p{M}\\p{N}]+";
+const actionBody = (phrase: string, language?: string) => {
+  const fillers = language ? FILLERS[language] : undefined;
+  const sep = fillers?.length ? `${WORD_SEP}(?:(?:${fillers.join("|")})${WORD_SEP}){0,2}` : WORD_SEP;
+  const words = fold(phrase).split(" ");
+  // Existing phrases include determiners ("confirmer la commande"). Treat those
+  // as fillers too, so the same zero-to-two bound applies to every spelling.
+  return words.filter((w, i) => i === 0 || i === words.length - 1 || !fillers?.includes(w)).join(sep);
+};
+const actionPattern = (language: string, phrase: string) => {
+  const body = actionBody(phrase, language);
+  return new RegExp(NO_ACTION_EDGES.has(language) ? body : `(?<![\\p{L}\\p{M}\\p{N}])${body}(?![\\p{L}\\p{M}\\p{N}])`, "u");
+};
+const OTHER_ACTION_PATTERNS = new Map(Object.entries(OTHER_ACTIONS).map(([language, { anywhere, submit, now }]) => {
+  const sep = NO_ACTION_EDGES.has(language) ? "\\s*" : WORD_SEP;
+  const when = now.map(w => actionBody(w)).join("|");
+  return [language, {
+    anywhere: anywhere.map((phrases) => phrases.map((p) => actionPattern(language, p))),
+    submit: submit.map((words, group) => words.map((w) => {
+      const complement = (COMPLEMENTS[language]?.[group] ?? []).map(p => actionBody(p, language)).join("|");
+      const action = `${actionBody(w)}${complement ? `(?:${sep}(?:${complement}))?` : ""}`;
+      return new RegExp(`^(?:(?:${when})${sep})?${action}(?:${sep}(?:${when}))?$`, "u");
+    })),
+  }];
+}));
+// One first-word lookup per token; each candidate has a constant, bounded gap.
+function phraseIndex(phrases: [NotAllowed, string, string][]) {
+  const index = new Map<string, Map<string, NotAllowed>>();
+  for (const [code, first, second] of phrases) {
+    if (!index.has(first)) index.set(first, new Map());
+    index.get(first)!.set(second, code);
+  }
+  return index;
+}
+const LEGACY_INDEX = phraseIndex(LEGACY_ACTION_PHRASES);
+const ACTION_INDEX = phraseIndex(ACTION_PHRASES);
+const EN_FILLERS = new Set(FILLERS.en);
+function phraseRefusals(run: string[], index: Map<string, Map<string, NotAllowed>>, b: { np(x: NotAllowed): void }, gaps = false) {
+  for (let i = 0; i + 1 < run.length; i++) {
+    const ends = index.get(run[i]);
+    if (!ends) continue;
+    for (let j = i + 1; j < run.length && j <= i + (gaps ? 3 : 1); j++) {
+      const code = ends.get(run[j]);
+      if (code) b.np(code);
+      if (!EN_FILLERS.has(run[j])) break;
+    }
+  }
+}
+
+function otherActionRefusals(text: string, b: { np(x: NotAllowed): void }, submit = false): void {
+  const folded = norm(fold(text));
+  for (const language of ["en", ...listsFor(folded)]) {
+    const value = LATIN_ACTIONS.has(language) ? stripAccents(folded) : folded;
+    const patterns = OTHER_ACTION_PATTERNS.get(language)!;
+    const groups = submit ? patterns.submit : patterns.anywhere;
+    if (groups[0].some((re) => re.test(value))) b.np("login_or_password");
+    if (groups[1].some((re) => re.test(value))) b.np("payment");
+  }
+}
+
+function actionRefusals(text: string, b: { np(x: NotAllowed): void }): void {
+  const base = invisible(text).normalize("NFKC");
+  const runs = [fold(base), fold(base.replace(/(\p{Ll})(\p{Lu})/gu, "$1 $2"))]
+    .map((s) => s.split(/[^\p{L}\p{M}\p{N}]+/u).filter(Boolean));
+  for (const run of runs) {
+    phraseRefusals(run, ACTION_INDEX, b, true);
+  }
+  otherActionRefusals(text, b);
+}
 // Every marker's run-together form, searched inside every chunk (round 94, coordinator's decision): a
 // marker anywhere inside a word counts ("recaptcha", "mypassword", "footpath" for "otp").
 // Markers whose run-together form has SHORT_MARKER characters or more are found inside skeletons (across
@@ -264,9 +433,6 @@ const MARKERS: [NotAllowed, string[]][] = MARKER_PHRASES.flatMap(([code, ps]) =>
   ps.flatMap((p) => joinings(p.split(" ")).map((w): [NotAllowed, string[]] => [code, w])),
 );
 const ID_LISTS = ["aria-labelledby", "aria-describedby", "aria-details", "aria-errormessage", "aria-owns"];
-// Characters that render as nothing (zero-width, soft hyphen, bidi marks, variation selectors and the
-// like) are removed before any text is judged (round 90).
-const invisible = (t: string) => t.replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
 const MAX_REFS = 50; // ids in one reference attribute, and labels for one id; more refuses (round 89)
 // Elements that break a line of text. Anything else (custom elements included) is inline, as in a browser.
 const BLOCK = new Set([
@@ -274,6 +440,23 @@ const BLOCK = new Set([
   "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr", "input", "legend", "li", "main", "menu", "nav", "ol",
   "optgroup", "option", "p", "pre", "section", "select", "summary", "table", "tbody", "td", "textarea", "tfoot", "th", "thead", "tr", "ul",
 ]);
+interface JudgedText {
+  words: string[]; skeleton: string; card: boolean;
+  basic: Set<NotAllowed>; actions: Set<NotAllowed>; submit: Set<NotAllowed>;
+}
+function judgeText(text: string, cache: Map<string, JudgedText>): JudgedText {
+  const old = cache.get(text);
+  if (old) return old;
+  const { words, chunks, runs } = tokens(text);
+  const basic = new Set<NotAllowed>(), actions = new Set<NotAllowed>(), submit = new Set<NotAllowed>();
+  for (const run of runs) phraseRefusals(run, LEGACY_INDEX, { np: c => basic.add(c) });
+  for (const c of new Set(chunks)) for (const [code, inside] of MARKER_SHORT) if (c.includes(inside)) basic.add(code);
+  actionRefusals(text, { np: c => actions.add(c) });
+  otherActionRefusals(text, { np: c => submit.add(c) }, true);
+  const value = { words: [...new Set(words)], skeleton: skeleton(text), card: hasCardNumber(text), basic, actions, submit };
+  cache.set(text, value);
+  return value;
+}
 function auditForm(form: N, b: { np(x: NotAllowed): void }, ctx: AuditContext): void {
   let used = 0;
   let nodes = 0;
@@ -283,23 +466,26 @@ function auditForm(form: N, b: { np(x: NotAllowed): void }, ctx: AuditContext): 
     b.np("too_large");
   };
   const bag = new Set<string>(); // every word the form and everything tied to it says
-  const chunkSeen = new Set<string>(); // chunks already searched
-  const skeletons: string[] = []; // every skeleton read, for the long words of the many-word markers
-  // judge: one text's words and chunks (short markers inside chunks); with `skel`, also its skeleton (kept
-  // for the MARKERS check) and its card digits
-  const judge = (text: string, skel: boolean) => {
+  const skeletons = new Set<string>();
+  // Charge every read even on a cache hit: sharing classification never grants extra budget.
+  const charged = (text: string) => {
     used += text.length;
-    if (used > MAX_AUDIT_TEXT) return tooLarge();
-    const { words, chunks } = tokens(text);
-    for (const w of words) bag.add(w);
-    for (const c of chunks) {
-      if (chunkSeen.has(c)) continue;
-      chunkSeen.add(c);
-      for (const [code, inside] of MARKER_SHORT) if (c.includes(inside)) b.np(code);
-    }
+    if (used > MAX_AUDIT_TEXT) { tooLarge(); return undefined; }
+    return judgeText(text, ctx.texts);
+  };
+  const judge = (text: string, skel: boolean) => {
+    const value = charged(text);
+    if (!value) return;
+    for (const w of value.words) bag.add(w);
+    for (const c of value.basic) b.np(c);
     if (!skel) return;
-    if (hasCardNumber(text)) b.np("payment");
-    skeletons.push(skeleton(text));
+    for (const c of value.actions) b.np(c);
+    if (value.card) b.np("payment");
+    skeletons.add(value.skeleton);
+  };
+  const submitText = (text: string) => {
+    const value = charged(text);
+    if (value) for (const c of value.submit) b.np(c);
   };
   // each attribute value is its own text (round 93: never joined); each element's attributes are judged
   // exactly once, whether reached as an ancestor or in a walk (round 96: twice spent the budget twice)
@@ -307,7 +493,11 @@ function auditForm(form: N, b: { np(x: NotAllowed): void }, ctx: AuditContext): 
   const attrs = (n: N) => {
     if (attrSeen.has(n)) return;
     attrSeen.add(n);
-    for (const v of Object.values(n.attribs ?? {})) judge(v, true);
+    const c = n.attribs ?? {};
+    for (const v of Object.values(c)) judge(v, true);
+    if (n.name === "input" && ["submit", "button", "image"].includes((c.type ?? "").trim().toLowerCase())) {
+      for (const v of [c.value, c.alt]) if (v !== undefined) submitText(v);
+    }
   };
   const units: N[] = [];
   const queued = new Set<N>();
@@ -377,30 +567,44 @@ function auditForm(form: N, b: { np(x: NotAllowed): void }, ctx: AuditContext): 
     roots.push(r);
     end = Math.max(end, w.z);
   }
-  type Item = { n: N; inside: boolean } | { sep: true };
+  type Item = { n: N; inside: boolean } | { sep: true } | { buttonEnd: true };
   for (const root of roots) {
     let spaced = "";
     // blocks of inline-joined text, as STRUCTURE (round 96: a "\n" marker was confused with a line break
     // in the page's own text, which split a word or a card number)
-    const blocks: string[] = [];
+    const blocks: { joined: string; spaced: string }[] = [];
     let cur = "";
+    let curSpaced = "";
+    let buttonText: { joined: string; spaced: string } | undefined;
     let size = 0;
     const endBlock = () => {
-      if (cur) blocks.push(cur);
+      if (cur) blocks.push({ joined: cur, spaced: curSpaced });
       cur = "";
+      curSpaced = "";
     };
     const work: Item[] = [{ n: root, inside: false }];
     while (work.length && !stop) {
       const it = work.pop()!;
+      if ("buttonEnd" in it) {
+        submitText(buttonText!.joined);
+        submitText(buttonText!.spaced);
+        buttonText = undefined;
+        continue;
+      }
       if ("sep" in it) {
         endBlock();
         continue;
       }
       const { n: x, inside } = it; // the kept subtrees are the union found above, so no new budget is needed
       if (x.type === "text") {
-        if (hasCardNumber(x.data)) b.np("payment");
+        if (charged(x.data ?? "")?.card) b.np("payment");
         spaced += (x.data ?? "") + " ";
         cur += x.data ?? "";
+        curSpaced += (x.data ?? "") + " ";
+        if (buttonText) {
+          buttonText.joined += x.data ?? "";
+          buttonText.spaced += (x.data ?? "") + " ";
+        }
         size += (x.data ?? "").length;
         if (spaced.length + size > MAX_AUDIT_TEXT) return tooLarge();
         continue;
@@ -416,6 +620,12 @@ function auditForm(form: N, b: { np(x: NotAllowed): void }, ctx: AuditContext): 
         if (nm === "input" && !KNOWN_INPUTS.has((c.type ?? "text").trim().toLowerCase())) b.np("unknown_control");
         attrs(x); // every attribute value: titles, labels, placeholders, values...
         block = BLOCK.has(nm);
+        // Capture a button's entire text in the same bounded walk. Nested controls already
+        // fail closed; do not copy their text into multiple nested accumulators.
+        if (nm === "button" && !buttonText) {
+          buttonText = { joined: "", spaced: "" };
+          work.push({ buttonEnd: true });
+        }
       }
       if (block) {
         endBlock();
@@ -430,15 +640,22 @@ function auditForm(form: N, b: { np(x: NotAllowed): void }, ctx: AuditContext): 
     // each block of inline-joined text is one text: its skeleton and its card digits (round 95: a card
     // number split across inline elements). Any white space in a block, line breaks, tabs and CR included,
     // is ordinary spacing (round 96).
-    for (const piece of blocks) judge(piece.replace(/\s+/g, " "), true);
+    for (const piece of blocks) {
+      judge(piece.joined.replace(/\s+/g, " "), true);
+      if (piece.spaced !== piece.joined) {
+        const value = charged(piece.spaced);
+        if (value) for (const c of value.actions) b.np(c);
+      }
+    }
   }
   if (stop) return;
   // EVERY marker of SHORT_MARKER characters or more, and every many-word marker with its words apart: a word
   // (or run-together piece) of SHORT_MARKER letters or more counts when it is inside any skeleton
   // ("SeCuRiTy Code" as "securitycode"; "mySeCuRiTy" and "code"), a shorter one only as a whole word
-  const all = skeletons.join("|");
+  const all = [...skeletons].join("|");
   const has = (w: string) => bag.has(w) || (w.length >= SHORT_MARKER && all.includes(w));
   for (const [code, need] of MARKERS) if (need.every(has)) b.np(code);
+  for (const [code, words] of ACTION_WORDS) if (words.some((w) => bag.has(w))) b.np(code);
 }
 
 // ONE set of per-element refusals (Codex round 85: the whole-form scan had its own, shorter copy). Used by
@@ -447,7 +664,7 @@ function auditForm(form: N, b: { np(x: NotAllowed): void }, ctx: AuditContext): 
 function elementRefusals(name: string, c: Record<string, string>, b: { np(x: NotAllowed): void }): void {
   if (captchaMarker(c) || EMBEDDED.has(name)) b.np("captcha");
   const auto = (c.autocomplete ?? "").toLowerCase().split(/\s+/);
-  if (auto.some((x) => x === "current-password" || x === "new-password" || x === "one-time-code")) b.np("login_or_password");
+  if (auto.some((x) => x === "username" || x === "current-password" || x === "new-password" || x === "one-time-code")) b.np("login_or_password");
   if (auto.some((x) => x.startsWith("cc-"))) b.np("payment");
   if (name === "input") {
     const type = (c.type ?? "text").trim().toLowerCase();
@@ -626,10 +843,11 @@ export function extractForms(doc: N, pageUrl: string, flattened = false): { form
     if (t === undefined) labelCache.set(n, (t = textOf(n, budget)));
     return t;
   };
+  const texts = new Map<string, JudgedText>();
   const forms = formNodes.slice(0, MAX_FORMS).map((f, i) => {
     const ancestors: N[] = [];
     for (let x = formUp.get(f) ?? null; x; x = x.up) ancestors.push(x.n);
-    const form = readForm(f, i + 1, pageUrl, base, labelFor, labelText, budget, { ids, labelsFor, ancestors, span });
+    const form = readForm(f, i + 1, pageUrl, base, labelFor, labelText, budget, { ids, labelsFor, ancestors, span, texts });
     // Flattening may have changed a control's owner or its ancestors: never submit a partial form.
     if (flattened && !form.not_allowed) form.not_allowed = "too_large";
     return form;

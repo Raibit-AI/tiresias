@@ -144,14 +144,14 @@ test("W-13: the MCP log tool returns the page inside untrusted_content", async (
 
 // ---- W-14 ----
 
-// Every file in the store (relative path -> bytes), minus the one private mode may append to (cooldowns).
+// Every file in the store (relative path -> bytes), minus minimal politeness state (cooldowns and hosts).
 function snapshot(): Map<string, string> {
   const m = new Map<string, string>();
   const walk = (d: string) => {
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
       const f = path.join(d, e.name);
       const rel = path.relative(home(), f);
-      if (rel === "cooldowns.jsonl") continue;
+      if (rel === "cooldowns.jsonl" || rel === "hosts") continue;
       if (e.isDirectory()) walk(f);
       else m.set(rel, fs.readFileSync(f).toString("base64") + ":" + fs.statSync(f).mtimeMs);
     }
@@ -160,7 +160,7 @@ function snapshot(): Map<string, string> {
   return m;
 }
 
-test("W-14: a private read, doors and check leave the store byte-identical, and never reveal a cache", async () => {
+test("W-14: a private read, doors and check leave page records byte-identical, and never reveal a cache", async () => {
   freshHome();
   const s = await start((req, res) => page(res, req.url));
   await engine.read(s.url + "/", {}, { agent: "normal" }); // a normal visit first: there IS a cache to protect
@@ -269,7 +269,7 @@ test("round 11 #1: private robots.txt state is not shared with other calls", asy
   assert.ok(s.count("/robots.txt") > n, "a normal call does not reuse a private call's robots state");
 });
 
-test("round 11 #8/#13: a private call, a dry-run clear and a log leave a missing store missing", async () => {
+test("round 11 #8/#13: private calls keep only spacing; dry-run clear and log add nothing", async () => {
   const s = await start((req, res) => page(res, req.url));
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiresias-ghost-"));
   const ghost = path.join(root, "store");
@@ -278,16 +278,16 @@ test("round 11 #8/#13: a private call, a dry-run clear and a log leave a missing
     await engine.read(s.url + "/", {}, { agent: "p", private: true });
     await engine.doors(s.url + "/", { agent: "p", private: true });
     await engine.check(s.url + "/", { agent: "p", private: true });
-    assert.ok(!fs.existsSync(ghost), "private calls create nothing");
+    assert.deepEqual(fs.readdirSync(ghost), ["hosts"], "private calls keep only spacing");
     const cd = await import("../cooldown.js");
     assert.equal(cd.cooldownLeft("http://x.test"), 0);
-    assert.ok(!fs.existsSync(ghost), "a cooldown lookup creates nothing");
+    assert.deepEqual(fs.readdirSync(ghost), ["hosts"], "a cooldown lookup creates nothing");
     const r = await cleanup.clearStore({ dryRun: true });
     assert.equal(r.total_bytes_freed, 0);
     await engine.dailyLog();
     await engine.queryHistory({});
     await engine.queryReceipts({});
-    assert.ok(!fs.existsSync(ghost), "dry-run clear, log, history and receipts create nothing");
+    assert.deepEqual(fs.readdirSync(ghost), ["hosts"], "dry-run clear, log, history and receipts create nothing");
     // MCP startup and listing with a private session writes nothing either
     process.env.TIRESIAS_PRIVATE = "1";
     const [a, b] = InMemoryTransport.createLinkedPair();
@@ -296,7 +296,7 @@ test("round 11 #8/#13: a private call, a dry-run clear and a log leave a missing
     await client.connect(b);
     await client.callTool({ name: "read", arguments: { url: s.url + "/" } });
     await client.close();
-    assert.ok(!fs.existsSync(ghost), "a private MCP session creates nothing");
+    assert.deepEqual(fs.readdirSync(ghost), ["hosts"], "a private MCP session creates nothing");
   } finally {
     delete process.env.TIRESIAS_PRIVATE;
   }
@@ -309,7 +309,7 @@ test("round 11 #8: a private 429 writes only the cooldown line, and no pid marke
   await engine.read(s.url + "/", {}, { agent: "p", private: true });
   const names = fs.readdirSync(home()).sort();
   assert.ok(names.includes("cooldowns.jsonl"));
-  for (const n of names) assert.ok(["cooldowns.jsonl", "cache"].includes(n), `unexpected ${n}`);
+  for (const n of names) assert.ok(["cooldowns.jsonl", "cache", "hosts"].includes(n), `unexpected ${n}`);
   assert.deepEqual(fs.readdirSync(path.join(home(), "cache")), []);
 });
 
@@ -750,7 +750,7 @@ test("round 12 #3: a private 429 writes the cooldown line only: no cache/ made, 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiresias-r12-"));
   process.env.TIRESIAS_HOME = path.join(root, "store");
   await engine.check(s.url + "/", { agent: "p", private: true });
-  assert.deepEqual(fs.readdirSync(rawHome()), ["cooldowns.jsonl"]);
+  assert.deepEqual(fs.readdirSync(rawHome()).sort(), ["cooldowns.jsonl", "hosts"]);
   // an existing lax store and cache keep their modes
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tiresias-r12-"));
   fs.mkdirSync(path.join(dir, "cache"), { mode: 0o755 });

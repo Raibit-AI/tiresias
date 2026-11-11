@@ -207,7 +207,23 @@ export function loadLimits(): Limits {
 
 // Keys checked only where they are used (like "scanner"): a bad one fails the calls that use it, by name,
 // and never stops clear or the daily trim.
-const OWN_CHECK_KEYS = ["doors", "sites", "translator", "rendering", "saving", "anchoring", "anchor_calendars"]; // translator: v0.7 W-26; rendering: v0.7 W-10; saving: v0.8 W-28; anchoring, anchor_calendars: v0.8 W-08
+export const SECURITY_CHOICES = {
+  get_form_actions: ["read", "slip"],
+  private_spacing: ["shared", "none"],
+  hook_secrets: ["hidden", "inherit"],
+  text_views: ["marked", "wrapped"],
+} as const;
+export type SecurityChoice = keyof typeof SECURITY_CHOICES;
+export function parseChoice<K extends SecurityChoice>(name: K, value: unknown): (typeof SECURITY_CHOICES)[K][number] {
+  if (typeof value === "string" && (SECURITY_CHOICES[name] as readonly string[]).includes(value)) return value as (typeof SECURITY_CHOICES)[K][number];
+  throw new ConfigError(`config.json: "${name}" must be ${SECURITY_CHOICES[name].map((s) => JSON.stringify(s)).join(" or ")}.`);
+}
+export function loadChoice<K extends SecurityChoice>(name: K): (typeof SECURITY_CHOICES)[K][number] {
+  const o = inForceConfig();
+  return o && Object.hasOwn(o, name) ? parseChoice(name, o[name]) : SECURITY_CHOICES[name][0];
+}
+
+const OWN_CHECK_KEYS = [...Object.keys(SECURITY_CHOICES), "doors", "sites", "translator", "rendering", "saving", "anchoring", "anchor_calendars"]; // translator: v0.7 W-26; rendering: v0.7 W-10; saving: v0.8 W-28; anchoring, anchor_calendars: v0.8 W-08
 export const KNOWN_KEYS = [...Object.keys(DEFAULT_LIMITS), ...SIGNING_KEYS, ...SAFETY_KEYS, "scanner", ...OWN_CHECK_KEYS];
 
 // W-30: how a first read of a site treats the six door checks. "background" (the default): the page first,

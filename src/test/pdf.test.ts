@@ -265,7 +265,7 @@ test("private mode reads a PDF and saves nothing about it", async () => {
   const files: string[] = [];
   const walk = (d: string) => fs.readdirSync(d, { withFileTypes: true }).forEach((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : files.push(path.relative(dir, path.join(d, e.name)))));
   walk(dir);
-  assert.deepEqual(files.filter((f) => f !== "cooldowns.jsonl"), []);
+  assert.deepEqual(files.filter((f) => f !== "cooldowns.jsonl" && !f.startsWith("hosts/")), []);
   assert.ok(os.tmpdir());
 });
 
@@ -600,19 +600,18 @@ test("round 29 #4: a version 6 PDF cache is rebuilt, so old 'Page N' receipts an
   assert.ok(dir);
 });
 
-test("round 29 #5: a busy child with a dead parent is killed by its own watchdog thread within about a second", async () => {
-  // the helper: starts the watchdog exactly as pdfchild.ts does, then spins without ever yielding
+test("round 29 #5: a busy child with a dead parent is killed by its external watchdog within about a second", async () => {
+  // The parser never yields; the trusted parent starts its watchdog outside the child.
   const helper = `
-    import { startParentWatchdog } from ${JSON.stringify("file://" + path.resolve("dist/parentwatch.js"))};
-    startParentWatchdog();
-    process.send({ ready: true, pid: process.pid });
-    // after the message has gone out: a synchronous loop, so no event loop turn will ever happen again
-    setTimeout(() => { for (;;) {} }, 300);
+    process.send({ ready: true, pid: process.pid }, () => { for (;;) {} });
   `;
   const parent = `
     import { fork } from "node:child_process";
+    import { startParentWatchdog } from ${JSON.stringify("file://" + path.resolve("dist/parentwatch.js"))};
     const c = fork(${JSON.stringify(path.join(os.tmpdir(), `tiresias-busy-${process.pid}.mjs`))}, [], { execArgv: [], env: {}, stdio: ["ignore", "ignore", "ignore", "ipc"] });
-    c.once("message", (m) => { console.log(m.pid); });
+    const w = startParentWatchdog(c.pid);
+    await Promise.all([new Promise((r) => c.once("message", r)), new Promise((r) => w.once("message", r))]);
+    console.log(c.pid);
     setInterval(() => {}, 1000);
   `;
   fs.writeFileSync(path.join(os.tmpdir(), `tiresias-busy-${process.pid}.mjs`), helper);
@@ -725,10 +724,13 @@ test("round 31/32: a child that dies before answering fails at once; dying after
     // after: once the complete answer is in, the final check kills the child and waits until it is gone
     // (so its exit event has fired) before giving an under-cap reading. The answer still stands.
     let answeredBy: import("node:child_process").ChildProcess | null = null;
+    let watchdogBy: import("node:child_process").ChildProcess | null = null;
     const { ChildProcess } = await import("node:child_process");
     const emit = ChildProcess.prototype.emit;
     ChildProcess.prototype.emit = function (this: import("node:child_process").ChildProcess, ev: string | symbol, ...args: unknown[]) {
-      if (ev === "message") answeredBy = this;
+      const d = args[0];
+      if (ev === "message" && d && typeof d === "object" && ("result" in d || "error" in d)) answeredBy = this;
+      if (ev === "message" && d && typeof d === "object" && "ready" in d) watchdogBy = this;
       return (emit as (...a: unknown[]) => boolean).apply(this, [ev, ...args]);
     } as typeof emit;
     let killedAfter = false;
@@ -738,12 +740,15 @@ test("round 31/32: a child that dies before answering fails at once; dying after
         const c = answeredBy as import("node:child_process").ChildProcess | null;
         if (c && !killedAfter) {
           killedAfter = true;
-          // the exit event of THIS child has been delivered (to every listener) before the reading is given
-          const exited = new Promise<void>((resolve, reject) => {
+          const watchdog = watchdogBy as import("node:child_process").ChildProcess | null;
+          assert.ok(watchdog);
+          // Both exit events have been delivered before the final reading, after a complete parser answer.
+          const exited = Promise.all([c, watchdog].map((child) => new Promise<void>((resolve, reject) => {
             const t = setTimeout(() => reject(new Error("the child did not exit within 5 s")), 5000);
-            c.once("exit", () => setImmediate(() => (clearTimeout(t), resolve())));
-          });
+            child.once("exit", () => setImmediate(() => (clearTimeout(t), resolve())));
+          })));
           c.kill("SIGKILL");
+          watchdog.kill("SIGKILL");
           await exited;
         }
         return 10;

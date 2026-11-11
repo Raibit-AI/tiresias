@@ -80,7 +80,7 @@ export async function runUntrusted<T>(job: Job, size: number): Promise<T> {
   // A PDF is never parsed inline or in the worker thread: it gets its own process (pdfproc.ts), because
   // decoder buffers are not counted by a worker's heap limit.
   if (job.op === "pdf") return (await import("./pdfproc.js")).runPdfChild<T>(job);
-  if (size <= INLINE_MAX) return unwrap<T>(handle(job));
+  if (size <= INLINE_MAX && !(job.op === "parse" && job.kind === "plain" && job.mode === "calendar")) return unwrap<T>(handle(job));
   const sig = currentSignal();
   let release: () => void;
   try {

@@ -58,13 +58,13 @@ export interface ShelfRecord {
   declared_type?: string;
   declared_name?: string;
   agent: string;
-  source?: "provided_by_person";
+  source?: "provided_by_person" | "provided_by_agent";
   cut?: true;
 }
 
 // Put one warning on the shelf. Never in private mode. A full day file takes no more records (the warning
 // itself is unchanged and the receipts log still has it).
-export function record(w: { url: string; finalUrl: string; fw: FileWarning; f: FileFacts; agent?: string; source?: "provided_by_person" }, now = Date.now()): boolean {
+export function record(w: { url: string; finalUrl: string; fw: FileWarning; f: FileFacts; agent?: string; source?: "provided_by_person" | "provided_by_agent" }, now = Date.now()): boolean {
   if (isPrivate()) return false;
   const day = utcDay(now);
   let cut = false;
@@ -143,7 +143,7 @@ export function clean(x: unknown): ShelfRecord | null {
     url: c(o.url, MAX_URL_LOG), final_url: c(o.final_url, MAX_URL_LOG),
     ...str("declared_type", 200), ...str("declared_name", 255),
     agent: typeof o.agent === "string" ? c(o.agent, 200) : "unknown",
-    ...(o.source === "provided_by_person" ? { source: "provided_by_person" as const } : {}),
+    ...(o.source === "provided_by_person" || o.source === "provided_by_agent" ? { source: o.source } : {}),
   };
   if (cut) r.cut = true;
   return r;

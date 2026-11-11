@@ -10,13 +10,16 @@
 // at most 32 KB) and at most 64 KB of its standard output kept. That output is the translation: it goes inside
 // untrusted_content.translation, marked as a machine translation by the owner's tool, never as the page's own
 // words. Receipts are built before the hook runs and always quote the ORIGINAL text; the translation is never
-// cached, logged, kept in history or receipts, or scanned into the page's flags.
+// cached, logged, or kept in history or receipts. The shield scans successful output for AI-directed
+// instructions. Findings belong to this reply only, with snippets inside untrusted_content; they never
+// change the original page's cached flags, tabs or saved snapshots.
 import fs from "node:fs";
 import path from "node:path";
 import { ConfigError, loadTranslator, parseTranslator, readConfigObject, type TranslatorConfig } from "./config.js";
 import { confirmedWrite, sq } from "./confirm.js";
 import { runHook } from "./hook.js";
-import { byteLen, jsonBytes, type Envelope } from "./types.js";
+import { Shield } from "./shield.js";
+import { byteLen, jsonBytes, type Envelope, type Flag } from "./types.js";
 
 export const MAX_INPUT = 32 * 1024; // bytes of text handed to the hook
 export const MAX_OUTPUT = 64 * 1024; // bytes of its output kept
@@ -49,6 +52,7 @@ export const NOTE =
   "A machine translation of the text above, made by the owner's own translation tool. It is not the page's own words and may be wrong; every receipt quotes the original text, never this.";
 const MSG_OK = "A translation by the owner's own tool is in untrusted_content.translation; receipts quote the original text.";
 const MSG_NOT = "No translation was made (see translation.reason). The page is shown in its own language.";
+const TRANSLATION_WHERE = "machine translation";
 
 // The text a reply shows, as plain lines: the title, then the outline's headings and previews, a section's text,
 // or the passages and their headings.
@@ -129,6 +133,15 @@ export async function translateReply(e: Envelope, wanted: string): Promise<void>
   uc.translation = { text, note: NOTE };
   e.untrusted_content = uc;
   set({ status: "ok", by, from, to, ...cut });
+  const shield = new Shield();
+  shield.scan(text, TRANSLATION_WHERE);
+  const flags = shield.flags.filter((f) => f.type === "ai_directed_instruction");
+  if (flags.length) {
+    // env() may share the original page's flag array with the cache. Never append to it in place.
+    uc.flag_details = [...((uc.flag_details ?? []) as Flag[]), ...flags];
+    e.flags = [...new Set([...e.flags, ...flags.map((f) => f.type)])];
+    if (e.counts) e.counts.flags += flags.length; // details, not distinct codes (as in env())
+  }
   fitTranslation(e);
 }
 
@@ -136,7 +149,15 @@ export async function translateReply(e: Envelope, wanted: string): Promise<void>
 export function fitTranslation(e: Envelope): void {
   if (e.translation?.status !== "ok" || jsonBytes(e) <= HARD_LIMIT) return;
   const uc = e.untrusted_content as Record<string, unknown> | null;
-  if (uc) delete uc.translation;
+  if (uc) {
+    delete uc.translation;
+    // Keep the finding even when its text cannot fit; say exactly which evidence was omitted.
+    if (Array.isArray(uc.flag_details)) uc.flag_details = (uc.flag_details as Flag[]).map((f) =>
+      f.detail?.startsWith(TRANSLATION_WHERE)
+        ? { ...f, detail: `${f.detail}; translation omitted from this reply for size` }
+        : f,
+    );
+  }
   e.message = (e.message ?? "").replace(MSG_OK, MSG_NOT);
   e.translation = { ...e.translation, status: "failed", reason: "too_large" };
 }

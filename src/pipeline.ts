@@ -2,6 +2,7 @@
 // The read pipeline: choose a source, fetch it, decide walls and files, parse, cache, and build the reply
 // (read, check and doors).
 // (Split out of engine.ts in v0.5.1, behavior unchanged.)
+import { noteGetActions } from "./getactions.js";
 import { hostKey } from "./sitekey.js";
 import { startDoorProbe } from "./background.js";
 import { loadDoorsMode } from "./config.js";
@@ -12,7 +13,7 @@ import { FetchError, TiresiasError } from "./errors.js";
 import { politeFetch } from "./fetcher.js";
 import { after304, fromResponse, isFresh } from "./freshness.js";
 import { shown, type Passage } from "./reader.js";
-import { runUntrusted } from "./sandbox.js";
+import { PageTooComplex, runUntrusted } from "./sandbox.js";
 import { OVERLAY_TEXT, RENDERED_TEXT, RENDER_TEXT, loadRenderMode, looksLikeShell, renderHtml, type RenderMode, type RenderTop } from "./render.js";
 import type { Change, DiffResult } from "./diff.js";
 import * as receipts from "./receipts.js";
@@ -63,7 +64,7 @@ export function earlyOutcome(url: string, res: RawResponse): Envelope | null {
 
 // W-20: how a page is parsed, by how it is read (files.ts decided that from its first bytes, its type and
 // its name). Scripts, CSV, calendar and contact files are read as plain text, never as markdown.
-export type ParseJob = { op: "parse"; kind: "html" | "json" | "text" | "svg" | "plain"; mode?: "script" | "csv" | "calendar" | "contact"; body: string; url: string; wall?: boolean; lang?: string; rendered?: Rendered } | { op: "pdf"; bytes: Uint8Array; url: string; lang?: string };
+export type ParseJob = { op: "parse"; kind: "html" | "json" | "text" | "svg" | "plain"; mode?: "script" | "csv" | "calendar" | "contact"; body: string; url: string; wall?: boolean; lang?: string; rendered?: Rendered } | { op: "pdf"; bytes: Uint8Array; url: string; lang?: string; secrets?: import("./echo.js").Secrets };
 // v0.7 track 2: the HTML of a rendered page, its hidden elements marked by the browser, and whether the browser decided
 // its walls (then its markup is not judged again).
 export type Rendered = { mark: string; complete: boolean; wallDecided: boolean };
@@ -81,8 +82,9 @@ export const looksHtml = (contentType: string | null | undefined, body: string):
   /html/.test(mimeOf(contentType)) || /<(!doctype html|html|body|form)\b/i.test(body.slice(0, 65536));
 // `wallCheck`: the response is HTML whatever reader its name chose, so its wall markers are looked for
 // (Codex round 63: a login page served as text/html at /login.csv is still a wall).
-export async function parsePage(read: ReadAs, body: string, bytes: Buffer | undefined, url: string, fileFlags: FileFlag[] = [], wallCheck = false, lang?: string | null, rendered?: Rendered) {
+export async function parsePage(read: ReadAs, body: string, bytes: Buffer | undefined, url: string, fileFlags: FileFlag[] = [], wallCheck = false, lang?: string | null, rendered?: Rendered, secrets?: import("./echo.js").Secrets) {
   const job = parseJob(read, body, bytes, url, wallCheck, lang, rendered);
+  if (job.op === "pdf" && secrets) job.secrets = secrets;
   const r = await runUntrusted<{ parsed: ParsedPage; wall: WallInfo | null }>(job, job.op === "pdf" ? Infinity : body.length);
   // What the response said against what it is goes first, so the shield's cap never pushes it out.
   if (fileFlags.length) r.parsed.flags = [...fileFlags.map((f): Flag => ({ type: f, snippet: "", detail: FLAG_TEXT[f] })), ...r.parsed.flags];
@@ -169,6 +171,9 @@ export const len = jsonBytes; // every page budget counts UTF-8 bytes of the JSO
 
 export async function buildContent(entry: CacheEntry, opts: Opts): Promise<{ uc: Uc; receipts: Receipt[]; error?: string }> {
   const p = entry.parsed;
+  // Receipt measurement repeats the final URL for every unit, on the main thread (as in tabs.ts).
+  const receiptUnits = opts.section === undefined ? p.sections.length : (p.sections.find((s) => s.n === opts.section)?.blocks.length ?? 0);
+  if (receiptUnits * (entry.final_url.length + 600) > 64 * 1024 * 1024) throw new PageTooComplex();
   const page = opts.page ?? 1;
   const fetchedAt = entry.fetched_at;
   // Receipts cite the URL that was actually read, and quote exact extracted text.
@@ -520,6 +525,7 @@ export async function finishPage(
   tool: Tool, url: string, entry: CacheEntry, unchanged: boolean, changedFrom: string | null,
   opts: Opts, od: OriginDoors | null, now: string, persist: () => void, meta: CallMeta, diff: DiffState, notKept = false, serve: Serve = {},
 ): Promise<Envelope> {
+  if (!entry.source) noteGetActions(entry.parsed.forms, !notKept);
   const wantsContent = opts.question !== undefined || opts.section !== undefined || opts.page !== undefined || (tool === "read" && (opts.translate !== undefined || !!opts.save));
   // W-28 (v0.8): the snapshot is written before the receipts are recorded, so each recorded receipt names it.
   const sv = tool === "read" ? serve.save : undefined;

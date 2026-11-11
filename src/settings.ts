@@ -11,7 +11,7 @@
 import os from "node:os";
 import path from "node:path";
 import {
-  ConfigError, DEFAULT_ANCHORING, DEFAULT_CALENDARS, DEFAULT_DOORS, DEFAULT_LIMITS, DEFAULT_SAVING, parseAnchoring, parseCalendars, KNOWN_KEYS, parseAgentStyle, parseDoors, parseKeyFile, parseSafeBrowsing, parseSaving, parseScanner,
+  parseChoice, ConfigError, DEFAULT_ANCHORING, DEFAULT_CALENDARS, DEFAULT_DOORS, DEFAULT_LIMITS, DEFAULT_SAVING, parseAnchoring, parseCalendars, KNOWN_KEYS, parseAgentStyle, parseDoors, parseKeyFile, parseSafeBrowsing, parseSaving, parseScanner,
   parseSignatureAgent, parseTranslator, readConfigObject, writeConfig,
 } from "./config.js";
 import { defaultKeyFile } from "./safebrowsing.js";
@@ -45,6 +45,10 @@ const onOff = (name: string) => (s: string) => {
 };
 
 export const DEFS: Def[] = [
+  { name: "get_form_actions", default: "read", description: 'Reading a URL matching a GET form action seen on its source page: "read" reads it normally; "slip" requires a submit_form slip. Rendered scripts may never request the GET form actions on that page.', check: (v) => parseChoice("get_form_actions", v), fromText: (v) => parseChoice("get_form_actions", v) },
+  { name: "private_spacing", default: "shared", description: 'Private calls and form previews: "shared" writes origin and times only to share spacing across processes; "none" writes nothing and separate processes do not space these calls against each other.', check: (v) => parseChoice("private_spacing", v), fromText: (v) => parseChoice("private_spacing", v) },
+  { name: "hook_secrets", default: "hidden", description: 'Scanner and translator environment: "hidden" removes Tiresias secret variables; "inherit" passes the full owner environment, including those secrets.', check: (v) => parseChoice("hook_secrets", v), fromText: (v) => parseChoice("hook_secrets", v) },
+  { name: "text_views", default: "marked", description: 'Text views: "marked" keeps them readable with a marker before web content; "wrapped" wraps the text inside untrusted_content, like JSON. Agents should use JSON output.', check: (v) => parseChoice("text_views", v), fromText: (v) => parseChoice("text_views", v) },
   { name: "doors", default: DEFAULT_DOORS, description: 'How a first read of a site treats its door checks (llms.txt, MCP, API): "background" returns the page at once and checks them afterwards; "wait" checks them first (slower).', check: parseDoors, fromText: parseDoors },
   { name: "rendering", default: DEFAULT_RENDER, description: 'Running a page\'s JavaScript (W-10), in the installed Google Chrome, sandboxed and throwaway, with every request it makes going through Tiresias\'s rules: "off" never; "ask" when a read asks for it; "auto" also when a plain read is an empty JavaScript shell. TIRESIAS_RENDERING overrides it.', check: parseRender, fromText: parseRender },
   { name: "saving", default: DEFAULT_SAVING, description: 'Keeping a signed snapshot of a page a read asks to save (W-28): "off" never; "ask" when a read asks for it (read --save, or save on the MCP read). Snapshots are kept in this profile\'s saved/ folder; see tiresias saved.', check: parseSaving, fromText: parseSaving },
@@ -100,7 +104,7 @@ const SITE_DEF = new Map(SITE_DEFS.map((d) => [d.name as string, d]));
 const ENV: { name: string; default: string; description: string; secret?: true }[] = [
   { name: "TIRESIAS_HOME", default: "~/.tiresias", description: "The store folder (shared by every agent pointed at it)." },
   { name: "TIRESIAS_PROFILE", default: "default", description: "The profile to use when --profile is not given." },
-  { name: "TIRESIAS_PRIVATE", default: "off", description: "1 makes the whole session private: nothing about any visit is saved." },
+  { name: "TIRESIAS_PRIVATE", default: "off", description: "1 makes the whole session private: no page records are saved; minimal politeness state still applies." },
   { name: "TIRESIAS_SAFE_BROWSING", default: "on", description: "0 turns the Safe Browsing check off for the session." },
   { name: "TIRESIAS_ALLOW_PORTS", default: "none", description: 'More ports to allow on every site, like "8080,9000-9100".' },
   { name: "TIRESIAS_MAX_BYTES", default: String(5 * 1024 * 1024), description: "The most bytes of a page that are read." },
@@ -377,7 +381,7 @@ export function reset(name: string | undefined, rest: string[], priv: boolean, c
 // edit that loosened it). Nothing in config.json changes; the record does, and history says who confirmed it.
 export function confirmNow(name: string | undefined, rest: string[], priv: boolean, confirm?: string): ChangeResult {
   if (priv) throw new ConfigError(PRIVATE);
-  if (!name || !isRisky(name)) throw new ConfigError("Usage: tiresias settings confirm <risky setting> [<site>] --confirm \"...\". Risky settings: saving, rendering, translator, scanner, anchoring, anchor_calendars, safe_browsing, and the site settings ports, spacing_seconds, never_visit, hand_off.");
+  if (!name || !isRisky(name)) throw new ConfigError("Usage: tiresias settings confirm <risky setting> [<site>] --confirm \"...\". Risky settings: private_spacing, hook_secrets, saving, rendering, translator, scanner, anchoring, anchor_calendars, safe_browsing, and the site settings ports, spacing_seconds, never_visit, hand_off.");
   const site = SITE_DEF.has(name) ? siteArgs(name, rest, false).site : undefined;
   if (!site && rest.length) throw new ConfigError(`Usage: tiresias settings confirm ${name} --confirm "..."`);
   const file = configFile();

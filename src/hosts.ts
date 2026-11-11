@@ -3,18 +3,19 @@
 // in the shared hosts/ folder at the store root, holding the earliest time the next request to it may
 // start. A request reserves its slot under a short exclusive lock (an O_EXCL lock file, broken when
 // older than LOCK_STALE_MS), so the CLI and the MCP server running side by side space their requests
-// to one site as one queue does. Private mode and form_preview read the spacing but never write it (a
-// private visit leaves no trace of which site it called; a preview writes nothing); their spacing then
-// holds within the process only.
+// to one site as one queue does. Private calls and previews share this minimal politeness state too.
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { loadChoice } from "./config.js";
 import { Refused } from "./errors.js";
 import { holdLease } from "./lifetime.js";
 import { lock } from "./lockfile.js";
 import { releaseLock, takeLock } from "./ownedlock.js";
 import { currentReadOnly } from "./safety.js";
 import { NOFOLLOW, NONBLOCK, ensureRoot, isPrivate, ownFile, readRoot, sha256, checkSub, mkdirOne } from "./store.js";
+
+const sharesSpacing = (): boolean => (!isPrivate() && !currentReadOnly()) || loadChoice("private_spacing") === "shared";
 
 export const HOSTS = "hosts";
 export const DEFAULT_SPACING_MS = 1_000;
@@ -65,7 +66,7 @@ export function reserve(origin: string, spacing: number, earliest: number, whenR
   const now = Date.now();
   let dir: string | null;
   try {
-    if (isPrivate() || currentReadOnly()) {
+    if (!sharesSpacing()) {
       const r = readRoot();
       dir = r && checkSub(path.join(r, HOSTS)) ? path.join(r, HOSTS) : null;
       return Math.max(now, earliest, dir ? readNext(fileOf(dir, origin), spacing) : 0);
@@ -108,7 +109,7 @@ export function reserve(origin: string, spacing: number, earliest: number, whenR
 // One request at a time across processes too (Codex round 75): while a request to a site is being
 // answered, a small "active" file (the owner's pid and the time) sits beside its spacing file; others wait
 // until it is gone. A file whose process is gone, or that is older than a call can live (75 s), is broken.
-// Private calls and previews wait for it but never write it. Store trouble never blocks a request.
+// Private calls and previews share it by default; unshared calls wait without writing. Store trouble never blocks a request.
 // v0.6 (coordinator's decision after Codex round 8): a lease is NEVER taken from a live process, however old it
 // is; a lease whose process is gone is stale at once. Only a lease whose owner cannot be told (no process id) is
 // judged by age, after this long (longer than any holder can live: a background job lasts up to 240 seconds).
@@ -186,9 +187,9 @@ function activeStale(f: string): boolean {
 }
 
 // A delay learned from robots.txt reaches other processes too (Codex round 84): the shared file's next
-// slot is moved to `until` if later. Never in private mode or a preview; no write without the lock.
+// slot is moved to `until` if later. Shared by default for private calls and previews; no write without the lock.
 export function extendNext(origin: string, until: number): void {
-  if (isPrivate() || currentReadOnly()) return;
+  if (!sharesSpacing()) return;
   try {
     const r = readRoot();
     const dir = r && checkSub(path.join(r, HOSTS)) ? path.join(r, HOSTS) : null;
@@ -215,9 +216,9 @@ export function extendNext(origin: string, until: number): void {
 }
 // v0.6 (Codex round 11, coordinator's decision): a held turn's completion is recorded WHOLE in the shared file:
 // last = the completion time, next = the later of the old next and completion + delay. Every reader, whatever
-// spacing it needs, then measures from the last completion. Never in private mode or a preview; under the lock.
+// spacing it needs, then measures from the last completion. Shared by default for private calls and previews; under the lock.
 export function noteCompletion(origin: string, t: number, until: number): void {
-  if (isPrivate() || currentReadOnly()) return;
+  if (!sharesSpacing()) return;
   try {
     const r = readRoot();
     const dir = r && checkSub(path.join(r, HOSTS)) ? path.join(r, HOSTS) : null;
@@ -251,7 +252,7 @@ const pause = (ms: number, signal: AbortSignal) =>
 export async function acquireActive(origin: string, signal: AbortSignal): Promise<() => void> {
   let dir: string | null = null;
   try {
-    if (!isPrivate() && !currentReadOnly()) {
+    if (sharesSpacing()) {
       // A writer makes hosts/ first, so the very first request to a site holds its lease too (round 77).
       const root = ensureRoot();
       const d = path.join(root, HOSTS);
@@ -266,7 +267,7 @@ export async function acquireActive(origin: string, signal: AbortSignal): Promis
   }
   if (!dir) return () => {};
   const f = fileOf(dir, origin) + ".active";
-  const writer = !isPrivate() && !currentReadOnly();
+  const writer = sharesSpacing();
   const giveUp = Date.now() + leaseWaitMs();
   for (;;) {
     if (writer) {

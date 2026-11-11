@@ -147,7 +147,7 @@ export function parseRobots(text: string, agent = "tiresias"): Pick<Robots, "rul
       if (!cur) continue;
       if (field === "crawl-delay") {
         const d = parseFloat(value);
-        if (d > 0) cur.delay = d;
+        if (d > 0) cur.delay = Math.max(cur.delay, d);
       } else if (value) {
         if (++total > MAX_RULES || value.length > MAX_PATTERN) {
           overflow = true; // too big to apply faithfully: the caller fails closed
@@ -164,7 +164,7 @@ export function parseRobots(text: string, agent = "tiresias"): Pick<Robots, "rul
   if (!chosen.length) chosen = groups.filter((g) => g.agents.includes("*"));
   return {
     rules: chosen.flatMap((g) => g.rules),
-    crawlDelay: chosen.map((g) => g.delay).find((d) => d > 0) ?? 0,
+    crawlDelay: chosen.reduce((delay, g) => Math.max(delay, g.delay), 0),
     sitemaps,
     overflow,
   };
@@ -274,6 +274,10 @@ async function fetchRobots(origin: string): Promise<Robots> {
         // Same header rules as every other request: record Retry-After at once,
         // and stop at a challenged response (any status, including a redirect).
         if (hop.status === 429 || hop.status === 503) setCooldown(hop.url.origin, hop.status, hop.headers.get("retry-after"));
+        if (hop.redirect && hop.headers.has("retry-after")) {
+          const seconds = setCooldown(hop.url.origin, hop.status, hop.headers.get("retry-after"));
+          if (seconds > 0) throw new Refused("The site asked Tiresias to wait (Retry-After). Not calling it again yet.", undefined, seconds, hop.url.href);
+        }
         const w = detectWall({ status: hop.status, headers: hop.headers }, true);
         if (w) {
           keep = !priv && !/(^|[\s,])no-store\b/i.test(hop.headers.get("cache-control") ?? "");
@@ -281,6 +285,8 @@ async function fetchRobots(origin: string): Promise<Robots> {
         }
       },
       beforeRequest: async (u, signal) => {
+        if (u.origin !== origin && (u.pathname !== "/robots.txt" || u.search))
+          throw new Refused("robots.txt redirected to another site's path, so Tiresias assumes the site says no.");
         if (cooldownLeft(u.origin) > 0) throw new Refused("The site asked Tiresias to wait (Retry-After). Not calling it again yet.", undefined, cooldownLeft(u.origin), u.href);
         turns.leaveOthers(u);
         await turns.take(u, spacingMs() / 1000, signal); // v0.5.1: robots.txt waits its turn too (v0.6: and a site's own spacing, in the queue)
@@ -327,7 +333,7 @@ async function fetchRobots(origin: string): Promise<Robots> {
       robots = p.overflow
         ? closed("robots.txt is too large to apply faithfully, so Tiresias assumes the site says no.", ONE_HOUR)
         : { mode: "parsed", rules: p.rules, crawlDelay: p.crawlDelay, sitemaps: p.sitemaps, expires: Date.now() + ONE_HOUR };
-      if (!p.overflow) noteDelay(origin, Math.min(p.crawlDelay, 30));
+      if (!p.overflow) noteDelay(origin, p.crawlDelay);
     } else if (res.status === 429 || res.status >= 500) {
       // RFC 9309: if robots.txt cannot be reached because of a server error,
       // assume everything is disallowed. And a 429/503 starts a cooldown.

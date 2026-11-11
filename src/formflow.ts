@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // W-04: forms as permission-gated actions (form_preview, form_submit).
 // (Split out of engine.ts in v0.5.1, behavior unchanged.)
+import { noteGetActions } from "./getactions.js";
 import { assertSiteAllowed } from "./sites.js";
 import { cooldownSeconds } from "./cooldown.js";
 import path from "node:path";
-import { COOLDOWN_TEXT, CRAWL_DELAY_TEXT, policyCheck, politeFetch } from "./fetcher.js";
+import { COOLDOWN_TEXT, CRAWL_DELAY_TEXT, policyCheck, politeFetch, Refused } from "./fetcher.js";
 import { shown } from "./reader.js";
 import { runUntrusted } from "./sandbox.js";
 import * as receipts from "./receipts.js";
@@ -26,7 +27,7 @@ import { buildContent, csvCount, detailOf, earlyOutcome, looksHtml, parsePage, r
 // form_preview: fetch the page fresh (robots, waits, Safe Browsing and signing, like read with fresh),
 // read its forms, check the agent's values, and show the EXACT request that would be sent, hidden
 // values replaced by "[set by the site]", with a preview hash and whether a slip covers the target.
-// Writes nothing: no cache, no history line, no receipts, no slip use.
+// Keeps no page record; shared politeness state still applies. A gated GET read can spend a slip use.
 //
 // form_submit: in ONE call, fetch the page fresh again, re-read the form, rebuild the request and its
 // hash; a different hash is form_changed and nothing is sent. Then the TARGET is checked (Safe
@@ -77,6 +78,7 @@ export async function loadForm(url: string, index: number, jar?: CookieJar): Pro
     return formEnv(url, "error", { index, reason: "not_html" }, NOT_HTML, { final_url: res.url });
   const r = await runUntrusted<{ forms: FullForm[]; omitted: number; flags: Flag[]; wall: WallInfo | null }>({ op: "forms", body: res.body, url: res.url }, res.body.length);
   throwIfCancelled();
+  noteGetActions(r.forms);
   if (r.wall) return wallEnv(url, r.wall, res.url, { final_url: res.url });
   const form = r.forms.find((f) => f.index === index);
   if (!form) return formEnv(url, "error", { index, reason: "no_such_form" }, NO_SUCH_FORM, { final_url: res.url, forms: r.forms.length + r.omitted });
@@ -197,12 +199,20 @@ export async function afterSubmit(url: string, top: FormTop, res: RawResponse, s
   const k = res.body || res.bytes?.length ? res.read : undefined;
   if (!k) return formEnv(url, "ok", top, `${SENT} The site accepted it (HTTP ${res.status}). Its answer was empty.`, uc);
   // The answer is read like a page (outline with receipts), in the worker, and never cached.
-  const { parsed, wall } = await parsePage(k, res.body, res.bytes, res.url, res.fileFlags, looksHtml(res.headers.get("content-type"), res.body), res.headers.get("content-language"));
+  let page: Awaited<ReturnType<typeof parsePage>>;
+  try {
+    page = await parsePage(k, res.body, res.bytes, res.url, res.fileFlags, looksHtml(res.headers.get("content-type"), res.body), res.headers.get("content-language"), undefined, secrets);
+  } catch (err) {
+    if (err instanceof SecretWithheld) return withheldEnv(url, top, res.status, answerSize(res));
+    throw err;
+  }
+  const { parsed, wall } = page;
   // Check the full extracted text, before previews can cut off a long secret or receipts can be recorded.
   // Joining blocks also covers a secret split by the reader's paragraph-size cap.
   if (!noSecrets(secrets) && await answerHoldsSecret([
     JSON.stringify(parsed), parsed.sections.flatMap((s) => s.blocks.map((b) => b.text)).join("\n"),
   ], secrets)) return withheldEnv(url, top, res.status, answerSize(res));
+  noteGetActions(parsed.forms);
   if (wall) {
     const e = wallEnv(url, wall, res.url, uc);
     e.message = `${SENT} The page that came back shows a wall: a person has to take it from here.`;
@@ -276,6 +286,12 @@ export async function formSubmit(url: string, index: number, values: unknown, pr
           method: b.method,
           body: b.body,
           submit: true,
+          beforeSend: (u) => {
+            if (!slips.claimedStillValid(claim, "submit_form", u.href)) {
+              top.reason = "no_slip";
+              throw new Refused("The claimed permission slip expired or was revoked before sending. Nothing was sent; the reserved use stays spent.");
+            }
+          },
           cookies: jar,
           files: fileOptions(), // W-20: an answer that is a file is fingerprinted and flagged
           // Honest about where the form came from: the page's origin and address, as a browser sends them.

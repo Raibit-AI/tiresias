@@ -235,10 +235,10 @@ test("W-18: private mode under a profile creates nothing, not even a sub-folder 
     assert.equal(r.profile, "quiet");
     assert.equal((await engine.bookmark("add", "x", s.url + "/", false, { agent: "t", private: true })).status, "refused");
   });
-  assert.deepEqual(tree(home), before);
+  assert.deepEqual(tree(home).filter((f) => f !== "hosts" && !f.startsWith("hosts/")), before);
   assert.throws(() => profiles.create("other", true), /Private mode/);
   assert.equal((await run(["profile", "create", "other"], { TIRESIAS_PRIVATE: "1" })).code, 1);
-  assert.deepEqual(tree(home), before);
+  assert.deepEqual(tree(home).filter((f) => f !== "hosts" && !f.startsWith("hosts/")), before);
 });
 
 test("W-18: clear --all on default never touches other profiles or the shared entries, and the default disk cap does not count them", async () => {

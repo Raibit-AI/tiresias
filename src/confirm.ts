@@ -13,7 +13,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { callContext } from "./context.js";
-import { DEFAULT_CALENDARS, parseAnchoring, parseCalendars, parseSafeBrowsing, parseSaving, parseScanner, parseTranslator, readConfigObject, writeConfig } from "./config.js";
+import { SECURITY_CHOICES, parseChoice, type SecurityChoice, DEFAULT_CALENDARS, parseAnchoring, parseCalendars, parseSafeBrowsing, parseSaving, parseScanner, parseTranslator, readConfigObject, writeConfig } from "./config.js";
 import { parseRender } from "./render.js";
 import { ConfigError } from "./errors.js";
 import * as history from "./history.js";
@@ -77,6 +77,8 @@ interface Top {
 }
 const renderRank = rank(["off", "ask", "auto"]);
 export const TOP: Top[] = [
+  { key: "private_spacing", looser: (c, n) => c !== "none" && n === "none", phrase: () => "YES, TURN OFF PRIVATE SPACING", what: () => "private spacing across processes turned off" },
+  { key: "hook_secrets", looser: (c, n) => c !== "inherit" && n === "inherit", phrase: () => "YES, SHARE TIRESIAS SECRETS WITH HOOKS", what: () => "Tiresias secrets shared with hooks" },
   { key: "saving", looser: (c, n) => rank(["off", "ask"])(n) > rank(["off", "ask"])(c), phrase: () => "YES, TURN ON SAVING", what: () => "saving turned on" },
   {
     key: "rendering",
@@ -410,7 +412,8 @@ function ratchet(raw: Record<string, unknown>, rec: Rec): void {
 }
 function validTop(key: string, v: unknown): boolean {
   try {
-    if (key === "saving") parseSaving(v);
+    if (Object.hasOwn(SECURITY_CHOICES, key)) parseChoice(key as SecurityChoice, v);
+    else if (key === "saving") parseSaving(v);
     else if (key === "rendering") parseRender(v);
     else if (key === "translator") parseTranslator(v);
     else if (key === "scanner") parseScanner(v);

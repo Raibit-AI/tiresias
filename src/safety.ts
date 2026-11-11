@@ -8,6 +8,7 @@
 // The connection's own `lookup` hook resolves the name, validates every
 // answer, and hands that same answer to the socket. TLS still verifies the
 // hostname because we connect by name, not by IP.
+import { guardGetAction } from "./getactions.js";
 import { createHash } from "node:crypto";
 import dns from "node:dns/promises";
 import fs from "node:fs";
@@ -367,6 +368,7 @@ export interface SafeFetchOptions {
   // Called before every hop (first request and each redirect). The polite
   // layer uses it for robots.txt, cooldowns and crawl-delay.
   beforeRequest?: (u: URL, signal: AbortSignal) => Promise<void>;
+  beforeSend?: (u: URL) => void; // synchronous recheck after policy waits and signing, immediately before dispatch
   // Called for EVERY hop as soon as its headers arrive, before the body is read
   // and before any redirect is followed. It may throw to stop the call. This is
   // where Retry-After is recorded and where a challenged redirect is caught, so
@@ -730,13 +732,15 @@ export class Wire {
   }
 }
 
-// v0.7: one plain GET, no redirects, no lookup pinning, capped by its connection's bytes (Wire). For API calls to a
+// v0.7: one plain GET, no redirects, guarded lookup, capped by its connection's bytes (Wire). For API calls to a
 // fixed endpoint (Google Web Risk), never for a site. The body is read up to `bodyMax`; past it, null.
 export function boundedGet(url: string, headers: Record<string, string>, bodyMax: number, wire: Wire, signal: AbortSignal): Promise<{ status: number; body: Buffer | null }> {
   return new Promise((resolve, reject) => {
-    const u = new URL(url);
+    const u = parseSafeUrl(url);
+    assertLiteral(u);
+    assertPort(u);
     const mod = u.protocol === "https:" ? https : http;
-    const req = mod.request({ hostname: u.hostname.replace(/^\[|\]$/g, ""), port: u.port || undefined, path: u.pathname + u.search, method: "GET", headers, agent: false, signal }, (res) => {
+    const req = mod.request({ hostname: u.hostname.replace(/^\[|\]$/g, ""), port: u.port || undefined, path: u.pathname + u.search, method: "GET", headers, lookup: guardedLookup as never, agent: false, signal }, (res) => {
       if (res.statusCode !== 200) {
         res.destroy();
         return resolve({ status: res.statusCode ?? 0, body: null });
@@ -880,6 +884,8 @@ export async function safeFetch(rawUrl: string, opts: SafeFetchOptions = {}): Pr
       const onSent = () => {
         if (sent) (sent.requests++, signed && sent.signed++);
       };
+      if (!opts.submit && (hop > 0 || method === "GET")) guardGetAction(u);
+      opts.beforeSend?.(u);
       let msg: http.IncomingMessage;
       try {
         msg = await abortable(requestOnce(u, headers, ctl.signal, onSent, hop === 0 ? method : "GET", hop === 0 ? body : undefined, wire));

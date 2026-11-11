@@ -444,7 +444,7 @@ test("W-20: check, watch, resume (retry and from a file) and a form answer all g
   await engine.bookmark("add", "rel", s.url + "/release", true);
   const w = await engine.watch(ctx);
   assert.equal(w.counts.file_warnings, 1);
-  assert.deepEqual(w.attention, [{ name: "rel", outcome: "file_warning", status: "file_warning", file: { kind: "program", risk: "high", fingerprint: `sha256:${sha(ELF)}` } }]);
+  assert.deepEqual(w.untrusted_content!.attention!, [{ name: "rel", outcome: "file_warning", status: "file_warning", file: { kind: "program", risk: "high", fingerprint: `sha256:${sha(ELF)}` } }]);
   // resume: a retry, then a file a person saved
   const walled = await engine.read(s.url + "/walled", {}, ctx);
   const id = walled.handoff!.ticket!;

@@ -9,7 +9,7 @@ import { diffSections } from "./diff.js";
 import { languageOf } from "./lang.js";
 import { inspect } from "./inside.js";
 import { normalizeList } from "./safelist.js";
-import { holdsSecret } from "./echo.js";
+import { holdsSecret, SecretWithheld } from "./echo.js";
 import type { ParsedPage, Section } from "./types.js";
 import { approxTextLength, detectWall, type WallInfo } from "./walls.js";
 
@@ -21,7 +21,7 @@ export type Job =
   // `rendered` (v0.7 track 2): the HTML of a rendered page, its hidden elements marked by the browser (inspect.ts)
   | { op: "parse"; kind: "html" | "json" | "text" | "svg" | "plain"; mode?: PlainMode; body: string; url: string; wall?: boolean; lang?: string; rendered?: { mark: string; complete: boolean; wallDecided: boolean } }
   | { op: "wall"; status: number; html: string; textChars?: number; lenient?: boolean; alsoThin?: boolean }
-  | { op: "pdf"; bytes: Uint8Array; url: string; lang?: string } // runs only in its own process (pdfproc.ts, pdfchild.ts)
+  | { op: "pdf"; bytes: Uint8Array; url: string; lang?: string; secrets?: import("./echo.js").Secrets } // runs only in its own process (pdfproc.ts, pdfchild.ts)
   | { op: "search"; parsed: ParsedPage; question: string; k: number }
   | { op: "language"; parsed: ParsedPage; lang?: string } // refresh a cached parse's header hint without reparsing it
   | { op: "diff"; old: Section[]; new: Section[] } // W-02: block diff against the cached copy
@@ -30,7 +30,7 @@ export type Job =
   | { op: "forms"; body: string; url: string } // W-04: a page's forms WITH hidden values (preview and submit; never cached)
   | { op: "echo"; texts: string[]; secrets: import("./echo.js").Secrets }; // v0.9 item B: does a form answer repeat a secret?
 
-export type Done = { result: unknown } | { error: "complexity" | "too_large" | "failed" | "pdf"; message?: string };
+export type Done = { result: unknown } | { error: "complexity" | "too_large" | "failed" | "pdf" | "secret_withheld"; message?: string };
 
 export function handle(job: Job): Done {
   const done = handleJob(job);
@@ -104,10 +104,11 @@ export async function handleAsync(job: Job): Promise<Done> {
   if (job.op !== "pdf") return handle(job);
   try {
     const { parsePdf } = await import("./pdf.js");
-    const parsed = await parsePdf(job.bytes, job.url);
+    const parsed = await parsePdf(job.bytes, job.url, job.secrets);
     parsed.language = languageOf(parsed, job.lang); // W-26 (v0.7)
     return { result: { parsed, wall: null } };
   } catch (e) {
+    if (e instanceof SecretWithheld) return { error: "secret_withheld" };
     if (e instanceof PdfError) return { error: "pdf", message: e.message };
     if (e instanceof ComplexityError) return { error: "complexity" };
     return { error: "failed", message: (e as Error).message };

@@ -17,7 +17,8 @@ export interface CallContext {
   // W-21: quarantine files written during this call. Each is deleted after its scanner hook returns, and
   // whatever is left (a call that failed or was cancelled in between) is deleted when the call ends.
   quarantine?: Set<string>;
-  readOnly?: boolean; // a call that writes nothing (form_preview): not even the shared spacing file
+  getActions?: { seen: Set<string>; full: boolean }; // private GET-action observations, only for this call
+  readOnly?: boolean; // form_preview: no page records; shared politeness state still applies
   site?: Set<import("./types.js").SiteSettingCode>;
   // W-25 (v0.6, coordinator's rule after Codex round 11): the site settings, read ONCE when the call started and
   // kept for the whole call. A change saved meanwhile applies to calls that start after it.

@@ -24,9 +24,12 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Cdp, CdpError, type CdpEvent } from "./cdp.js";
+import { getActionTarget, getActionTargetsMatch } from "./getactions.js";
 import { callContext } from "./context.js";
 import { Busy, Slots } from "./slots.js";
 import { ConfigError, TiresiasError, type FetchError } from "./errors.js";
+import { runUntrusted } from "./sandbox.js";
+import type { FullForm } from "./forms.js";
 import { politeFetch } from "./fetcher.js";
 import { shutdownSignal } from "./lifetime.js";
 import { READ_SLACK, fetchCap } from "./safety.js";
@@ -66,10 +69,10 @@ export function loadRenderMode(): RenderMode {
 // ---- what a reply says (fixed codes and counts only: top level) ----
 
 export type BlockReason =
-  | "not_get" | "not_needed" | "frame" | "navigation" | "worker" | "popup" | "scheme" | "request_cap" | "byte_cap"
+  | "form_action" | "not_get" | "not_needed" | "frame" | "navigation" | "worker" | "popup" | "scheme" | "request_cap" | "byte_cap"
   | "rules" | "wall" | "site_settings" | "unsafe_address" | "safe_browsing" | "file" | "too_large" | "fetch_failed" | "signing" | "error";
 export const BLOCK_REASONS: BlockReason[] = [
-  "not_get", "not_needed", "frame", "navigation", "worker", "popup", "scheme", "request_cap", "byte_cap",
+  "form_action", "not_get", "not_needed", "frame", "navigation", "worker", "popup", "scheme", "request_cap", "byte_cap",
   "rules", "wall", "site_settings", "unsafe_address", "safe_browsing", "file", "too_large", "fetch_failed", "signing", "error",
 ];
 export type RenderStatus = "rendered" | "cached" | "not_allowed" | "not_html" | "unavailable" | "failed";
@@ -103,7 +106,7 @@ export const RENDERED_TEXT = "Rendered: Tiresias ran the page's JavaScript in a 
 
 export const LIMITS = {
   ms: 20_000, // the whole render
-  quietMs: 500, // the page is settled when no request has been pending this long, after its load event
+  quietMs: 500, // no paused request or fetch for this long after loading finishes
   requests: 100,
   bytes: 10 * 1024 * 1024,
   perRequestBytes: 4 * 1024 * 1024, // what one request reserves from the budget (and may read at most)
@@ -421,6 +424,8 @@ export async function withRenderedPage<T>(pageUrl: string, body: string, fn: (p:
 async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) => Promise<T>): Promise<{ value: T; top: RenderTop }> {
   const chrome = findChrome();
   if (!chrome) throw new RenderUnavailable();
+  const forms = await runUntrusted<{ forms: FullForm[]; omitted: number }>({ op: "forms", body, url: pageUrl }, body.length);
+  const actions = forms.forms.filter((f) => f.method === "GET" && f.action).map((f) => getActionTarget(new URL(f.action!)));
   hookExit();
   sweepProfiles();
   const started = Date.now();
@@ -431,6 +436,8 @@ async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) 
   const signals = [ctl.signal, shutdownSignal, ...(outer ? [outer] : [])];
   const signal = AbortSignal.any(signals);
   const timer = setTimeout(() => ctl.abort(new Stop("timeout")), renderMs());
+  let navigationTimer: NodeJS.Timeout | undefined;
+  let settleTimer: NodeJS.Timeout | undefined;
   let dataDir: string | undefined;
   let proxy: Awaited<ReturnType<typeof deadProxy>> | undefined;
   let child: ChildProcess | undefined;
@@ -471,8 +478,11 @@ async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) 
     const mainFrame = { id: "" };
     let docServed = false;
     let pending = 0;
+    let outstanding = 0; // bounded metadata for paused requests, including local replies and refusals
     let lastActivity = Date.now();
     let loaded = false;
+    let domComplete = false;
+    let refusedNavigation = false;
     const budget = new ByteBudget(LIMITS.bytes, Math.min(fetchCap(), LIMITS.perRequestBytes));
 
     const fetchFor = async (e: CdpEvent): Promise<void> => {
@@ -480,37 +490,77 @@ async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) 
       const id: string = p.requestId;
       // "Aborted", not "BlockedByClient": a refused navigation then leaves the page as it was instead of committing
       // Chrome's own error page in its place (which would be read as the page).
-      const fail = (r: BlockReason) => (block(r), cdp.send("Fetch.failRequest", { requestId: id, errorReason: "Aborted" }, e.sessionId).catch(() => {}));
+      const fail = (r: BlockReason) => (block(r), cmd("Fetch.failRequest", { requestId: id, errorReason: "Aborted" }, e.sessionId).catch(() => {}));
       const url: string = String(p.request?.url ?? "");
       const type: string = String(p.resourceType ?? "");
       const method: string = String(p.request?.method ?? "");
       // The page itself: served from the body the plain read already fetched, exactly once, in the main frame.
       if (type === "Document" && e.sessionId === pageSession && p.frameId === mainFrame.id && !docServed && noFragment(url) === noFragment(pageUrl)) {
         docServed = true;
-        await cdp.send("Fetch.fulfillRequest", { requestId: id, responseCode: 200, responseHeaders: [{ name: "content-type", value: "text/html; charset=utf-8" }], body: b64(body) }, e.sessionId).catch(() => {});
+        await cmd("Fetch.fulfillRequest", { requestId: id, responseCode: 200, responseHeaders: [{ name: "content-type", value: "text/html; charset=utf-8" }], body: b64(body) }, e.sessionId).catch(() => {});
         return;
       }
       top.requests!++;
-      if (e.sessionId !== pageSession) return void fail("worker");
-      if (type === "Document") return void fail(p.frameId === mainFrame.id ? "navigation" : "frame");
-      if (!/^https?:/i.test(url)) return void fail("scheme");
+      if (e.sessionId !== pageSession) return await fail("worker");
+      if (type === "Document") {
+        if (p.frameId !== mainFrame.id) return await fail("frame");
+        if (!loaded) {
+          // Chrome aborts the old document's load before this refusal, so its load event may never arrive.
+          refusedNavigation = true;
+          if (domComplete) {
+            loaded = true;
+            lastActivity = Date.now();
+          } else if (!navigationTimer) {
+            // Give parsing a chance to finish, but return the plain read promptly if it was aborted too.
+            navigationTimer = setTimeout(() => {
+              navigationTimer = undefined;
+              if (!domComplete && !loaded) ctl.abort(new Stop("navigated"));
+            }, LIMITS.quietMs);
+          }
+        }
+        return await fail("navigation");
+      }
+      if (!/^https?:/i.test(url)) return await fail("scheme");
       if (type === "Preflight") {
         // A CORS check before a GET with extra headers. The page's own headers are never sent (Tiresias sends
         // its own), so it is answered here and the real request still goes through the rules.
         const want = String(p.request?.headers?.["Access-Control-Request-Method"] ?? p.request?.headers?.["access-control-request-method"] ?? "");
-        if (want.toUpperCase() !== "GET") return void fail("not_get");
+        if (want.toUpperCase() !== "GET") return await fail("not_get");
         const origin = String(p.request?.headers?.Origin ?? p.request?.headers?.origin ?? "*");
         const asked = String(p.request?.headers?.["Access-Control-Request-Headers"] ?? p.request?.headers?.["access-control-request-headers"] ?? "");
-        await cdp.send("Fetch.fulfillRequest", {
+        await cmd("Fetch.fulfillRequest", {
           requestId: id, responseCode: 204,
           responseHeaders: [{ name: "access-control-allow-origin", value: origin.slice(0, 2048) }, { name: "access-control-allow-methods", value: "GET" }, ...(asked ? [{ name: "access-control-allow-headers", value: asked.slice(0, 2048) }] : [])],
         }, e.sessionId).catch(() => {});
         top.requests!--; // not a request to any site
         return;
       }
-      if (method !== "GET") return void fail("not_get");
-      if (!TYPES_FETCHED.has(type)) return void fail("not_needed");
-      if (top.requests! > LIMITS.requests) return void fail("request_cap");
+      if (method !== "GET") return await fail("not_get");
+      const target = new URL(url);
+      const actionTarget = getActionTarget(target);
+      if (forms.omitted || actions.some((a) => getActionTargetsMatch(a, actionTarget))) return await fail("form_action");
+      if (!TYPES_FETCHED.has(type)) return await fail("not_needed");
+      // Check live forms too: scripts may have added a form or changed its action since the HTML arrived.
+      try {
+        const world = await cmd<{ executionContextId: number }>("Page.createIsolatedWorld", { frameId: mainFrame.id, worldName: "tiresias", grantUniveralAccess: false }, pageSession);
+        const r = await cmd<{ result?: { value?: unknown } }>("Runtime.evaluate", {
+          contextId: world.executionContextId, returnByValue: true, timeout: 1000,
+          expression: `(() => { /* get_form_actions */
+            const forms = Object.getOwnPropertyDescriptor(Document.prototype, 'forms').get.call(document);
+            if (forms.length > 20) return null;
+            const method = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'method').get;
+            const action = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'action').get;
+            const out = [];
+            for (let i = 0; i < forms.length; i++) if (method.call(forms[i]).toLowerCase() === 'get') out.push(action.call(forms[i]));
+            return out;
+          })()`,
+        }, pageSession);
+        const live = r.result?.value;
+        if (!Array.isArray(live) || live.length > 20 || live.some((a) => typeof a !== "string" || a.length > 8192)) return await fail("form_action");
+        if (live.some((a: string) => { const u = new URL(a, pageUrl); return getActionTargetsMatch(getActionTarget(u), actionTarget); })) return await fail("form_action");
+      } catch { return await fail("form_action"); }
+
+      if (top.requests! > LIMITS.requests) return await fail("request_cap");
       pending++;
       // Codex round 1 (HIGH): the byte cap is a shared budget, RESERVED before a request starts (each request may read
       // at most what it reserved), so requests running at once can never together exceed it. What a request did not
@@ -522,7 +572,7 @@ async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) 
         reserved = await budget.reserve(signal);
         // The reservation bounds what the connection may receive (headers, 1xx, compressed bytes: safety.ts Wire), less
         // one socket read of slack, so the charge never passes it; the decoded body is held to it too.
-        if (reserved <= READ_SLACK) return void fail("byte_cap");
+        if (reserved <= READ_SLACK) return await fail("byte_cap");
         const res = await callContext.run({ ...callContext.getStore(), signal, renderBudget: budget }, () => politeFetch(url, { maxBytes: reserved, wireBytes: reserved - READ_SLACK, followRedirects: false }));
         // Chrome must see the redirect itself: module bases and cross-origin checks depend on every URL.
         // safeFetch validated the target (including https downgrades); the next paused request goes through
@@ -533,24 +583,24 @@ async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) 
           const headers = [{ name: "location", value: new URL(location, res.url).href }];
           for (const [k, v] of res.headers) if (KEEP_HEADERS.has(k)) headers.push({ name: k, value: v.slice(0, 2048) });
           top.fetched!++;
-          await cdp.send("Fetch.fulfillRequest", { requestId: id, responseCode: res.status, responseHeaders: headers, body: "" }, e.sessionId).catch(() => {});
+          await cmd("Fetch.fulfillRequest", { requestId: id, responseCode: res.status, responseHeaders: headers, body: "" }, e.sessionId).catch(() => {});
           return;
         }
         // A file (a program, an archive, any binary the file plan names) or a PDF is never handed to the page: without a
         // read kind, the fetcher found a file in its first bytes.
-        if (res.file || !res.read || res.read === "pdf") return void fail("file");
+        if (res.file || !res.read || res.read === "pdf") return await fail("file");
         const buf = Buffer.from(res.body, "utf8");
         // Charged what was really received (after decompression, before charset decoding: Codex round 2, a UTF-16
         // body shrinks when decoded) or what is handed to the page, whichever is larger; never less than it fetched.
         charge = Math.max(res.size ?? reserved, buf.length);
-        if (charge > reserved) return void fail("byte_cap"); // re-encoding made it larger than what was reserved
+        if (charge > reserved) return await fail("byte_cap"); // re-encoding made it larger than what was reserved
         const headers: { name: string; value: string }[] = [];
         for (const [k, v] of res.headers) if (KEEP_HEADERS.has(k) && k !== "content-type") headers.push({ name: k, value: v.slice(0, 2048) });
         headers.push({ name: "content-type", value: utf8Type(res.headers.get("content-type")) });
         top.fetched!++;
-        await cdp.send("Fetch.fulfillRequest", { requestId: id, responseCode: res.status || 200, responseHeaders: headers, body: buf.toString("base64") }, e.sessionId).catch(() => {});
+        await cmd("Fetch.fulfillRequest", { requestId: id, responseCode: res.status || 200, responseHeaders: headers, body: buf.toString("base64") }, e.sessionId).catch(() => {});
       } catch (err) {
-        fail(signal.aborted ? "fetch_failed" : blockOf(err));
+        await fail(signal.aborted ? "fetch_failed" : blockOf(err));
       } finally {
         if (reserved > 0) budget.release(reserved, charge < 0 ? reserved : charge);
         pending--;
@@ -559,6 +609,7 @@ async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) 
     };
 
     cdp.on((e) => {
+      if (signal.aborted) return;
       const p = e.params;
       if (e.method === "Target.attachedToTarget") {
         const t = p.targetInfo ?? {};
@@ -575,7 +626,14 @@ async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) 
       }
       if (e.method === "Fetch.requestPaused") {
         lastActivity = Date.now();
-        void fetchFor(e);
+        if (outstanding >= LIMITS.requests + 1) return ctl.abort(new Stop("too_large"));
+        outstanding++;
+        void fetchFor(e).catch(() => {
+          ctl.abort(new Stop("browser_failed"));
+        }).finally(() => {
+          outstanding--;
+          lastActivity = Date.now();
+        });
         return;
       }
       if (e.method === "Page.javascriptDialogOpening" && e.sessionId === pageSession) {
@@ -583,9 +641,20 @@ async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) 
         cdp.send("Page.handleJavaScriptDialog", { accept: false }, pageSession).catch(() => {});
         return;
       }
-      if (e.method === "Page.loadEventFired" && e.sessionId === pageSession) {
+      if (e.method === "Page.domContentEventFired" && e.sessionId === pageSession && docServed) {
+        domComplete = true;
+        if (refusedNavigation) {
+          loaded = true;
+          lastActivity = Date.now();
+          clearTimeout(navigationTimer);
+          navigationTimer = undefined;
+        }
+      }
+      if (e.method === "Page.loadEventFired" && e.sessionId === pageSession && docServed) {
         loaded = true;
         lastActivity = Date.now();
+        clearTimeout(navigationTimer);
+        navigationTimer = undefined;
       }
     });
 
@@ -622,12 +691,12 @@ async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) 
     await cmd("Runtime.runIfWaitingForDebugger", {}, s);
     await cmd("Page.navigate", { url: pageUrl }, s);
 
-    // Settled: the load event came and no request has been pending for quietMs; or the time cap.
+    // Settled: loading finished and every paused handler and fetch has finished, then quietMs elapsed.
     await race(new Promise<void>((resolve) => {
       const tick = () => {
         if (signal.aborted) return; // the race has already ended; stop polling
-        if (loaded && pending === 0 && Date.now() - lastActivity >= LIMITS.quietMs) return resolve();
-        setTimeout(tick, 100);
+        if (loaded && pending === 0 && outstanding === 0 && Date.now() - lastActivity >= LIMITS.quietMs) return resolve();
+        settleTimer = setTimeout(tick, 100);
       };
       tick();
     }));
@@ -663,6 +732,8 @@ async function renderNow<T>(pageUrl: string, body: string, fn: (p: SettledPage) 
     throw stop;
   } finally {
     clearTimeout(timer);
+    clearTimeout(navigationTimer);
+    clearTimeout(settleTimer);
     ctl.abort(new Stop("cancelled"));
     if (child) {
       killTree(child);

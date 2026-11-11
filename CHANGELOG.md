@@ -2,6 +2,51 @@
 
 Built from docs/SPEC.md, section 10, which has the full detail of every version.
 
+## v1.1.0 (2026-11-10)
+
+The security deep dive. Every promise in SECURITY.md was attacked end to end, the way a hostile page or a fooled agent would, and each finding was fixed with a test or written down as a known limit in SECURITY.md.
+
+For owners:
+
+- Four new settings, shown in `tiresias settings`. `get_form_actions` is `read` by default; `slip` makes reading an address that matches a known GET form action need a `submit_form` slip. `private_spacing` is `shared` by default, so private calls and previews now wait their turn across processes and write only the site's origin and times; `none` turns that off after confirmation. `hook_secrets` is `hidden` by default, so your scanner and translator hooks no longer receive Tiresias's own secret variables; `inherit` restores the old behavior after confirmation. `text_views` is `marked` by default, so `--text` views and the default `log` and `needs` output mark where web text begins; `wrapped` wraps it the way JSON output does.
+- `tiresias keys rotate` gives you a new signing key while the old one stays in the directory for 7 days (`--overlap` 0 to 30). `--finish` ends the overlap early. `--slips` makes a new slip key and revokes every slip.
+- SECURITY.md states the form promise as the code keeps it: no form is sent without your permission slip, and recognizing sign-in, payment and purchase forms is best-effort in 13 languages.
+
+Forms:
+
+- Purchase forms without card fields ("Pay now", checkout) and sign-in forms without a password field are now recognized and refused. Recognition is by word lists in English, Spanish, French, German, Portuguese, Italian, Dutch, Russian, Chinese, Japanese, Korean, Arabic and Hindi.
+- A slip is checked again right before the form is sent. One that expired or was revoked while the submit waited is not used.
+- A rendered page's scripts may not request an address that matches a GET form action on that page.
+
+The site's rules:
+
+- A robots.txt redirect to another site is followed only to that site's own `/robots.txt`. Anything else counts as the site saying no.
+- Retry-After on a redirect is obeyed before the redirect is followed, for pages, robots.txt and rendered requests.
+- A Crawl-delay longer than 30 seconds is no longer shortened to 30: Tiresias declines the read instead of waiting less than the site asked. When robots groups merge, the longest delay applies.
+- An active Retry-After wait is not forgotten however large the cooldown log grows. If the wait cannot be read, Tiresias does not send.
+
+Web text stays data:
+
+- Machine translations are scanned by the injection shield. Flags stay with the reply, with snippets inside `untrusted_content`, and survive a translation dropped for size.
+- A bookmark name chosen by an agent appears inside `untrusted_content` in `watch` replies, not beside Tiresias's own fields.
+- Text an agent supplies to `resume` over MCP is recorded as provided by the agent, not by a person.
+
+Secrets, files and limits:
+
+- The Google Web Risk request gets the same private-address and port checks as every other request.
+- The PDF child process may no longer start worker threads.
+- Calendar files are always read in a worker thread with a time budget, whatever their size.
+- A secret the site echoes back is looked for in the full text of an Office answer or a PDF title before anything is shortened.
+- A page whose outline would take too long to build ends as `page_too_complex` instead of stalling other calls.
+- Requests waiting during a render keep only a bounded set of header fields in memory.
+- History and receipt scans stop on cancellation or at a 60 second deadline.
+
+Testing and releases:
+
+- An attack lab of hostile pages runs in the test suite, so every attack tried in this review stays tested.
+- The fuzzer (`scripts/fuzz.mjs`, opt-in) gained two targets that drive the real MCP server and the form flow with malformed input.
+- Releases are built by GitHub Actions and staged on npm through trusted publishing, with provenance and a software bill of materials. A person approves each staged version before anyone can install it, and no npm token is stored anywhere.
+
 ## v1.0.1 (2026-11-01)
 
 - Cancelling a read while it waits its turn no longer adds extra delays to later requests.

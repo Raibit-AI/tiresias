@@ -400,7 +400,7 @@ test("W-19: private mode creates nothing (no list download, no files) and still 
   const r = await engine.read(s.url + "/x", {}, { agent: "a", private: true });
   assert.equal(r.status, "ok");
   assert.equal(r.safety, "unchecked");
-  assert.equal(fs.existsSync(empty), false, "nothing created");
+  assert.deepEqual(fs.readdirSync(empty), ["hosts"], "only spacing created");
   assert.equal(listHits(), n, "no download in private mode");
   // With a list on disk: it is read and used, and nothing in safety/ changes.
   await fresh(["127.0.0.1"]);

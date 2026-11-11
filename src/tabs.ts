@@ -247,7 +247,7 @@ export function noteReply(store: TabStore, e: Envelope): TabNote | undefined {
   // Private calls leave no trace: not even the memory of an MCP session (section 9, 2026-10-16).
   if (e.private || isPrivate()) return undefined;
   if (e.status !== "ok" && e.status !== "unchanged") return undefined;
-  if (e.source === "provided_by_person") return undefined; // never cached, so nothing to re-show
+  if (e.source === "provided_by_person" || e.source === "provided_by_agent") return undefined; // never cached, so nothing to re-show
   const uc = (e.untrusted_content ?? {}) as Record<string, unknown>;
   try {
     return store.transact(() => {

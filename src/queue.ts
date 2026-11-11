@@ -10,8 +10,8 @@ import { noteApplied, siteSpacing } from "./sites.js";
 
 // Bounded (v0.5.1): a long-running MCP server keeps at most MAX_HOSTS sites in each. A queue entry is
 // removed when its last request has had its turn, and a site's waiting set when it is empty.
-// When each site was last called. Kept while its spacing can still matter (the longest wait is a 30-second
-// Crawl-delay), then pruned (Codex round 78: evicting by count could drop a spacing still owed).
+// When each site was last called. Kept while its spacing can still matter,
+// then pruned (Codex round 78: evicting by count could drop a spacing still owed).
 const lastHit = new Map<string, number>();
 const HIT_KEEP_MS = 60_000;
 // The earliest the NEXT request may start, as the last request's own spacing said (Codex round 79: a
@@ -140,6 +140,7 @@ export async function throttle(origin: string, delay: number, outer: AbortSignal
       const slot = reserve(origin, eff * 1000, Math.max((lastHit.get(origin) ?? 0) + eff * 1000, nextOk.get(origin) ?? 0), true);
       const wait = slot - Date.now();
       if (wait <= 0) break;
+      if (wait > 30_000) throw new Refused("The site's spacing wait is longer than Tiresias will wait.", undefined, Math.ceil(wait / 1000), url);
       await Promise.race([sleep(wait, mine.signal), cancelled]);
     }
     // The checks that matter: right before sending, not before queueing.

@@ -29,7 +29,7 @@ async function coldStart<T>(f: () => Promise<T>): Promise<T> {
   }
 }
 delete process.env.TIRESIAS_RENDERING;
-delete process.env.TIRESIAS_CHROME;
+// Preserve an explicitly configured Chrome installation when deciding whether to skip.
 const engine = await import("../engine.js");
 const render = await import("../render.js");
 const settings = await import("../settings.js");
@@ -82,6 +82,23 @@ const s = await serve((req, res) => {
       alert('hi'); confirm('ok?');
       setTimeout(() => { location.href = '/elsewhere'; }, 50);
     </script></body></html>`);
+  }
+  if (u === "/navigation-dom-complete") {
+    // Insert the sheet from the script so it delays load without blocking the script or DOMContentLoaded.
+    return html(res, `<html><head><title>Early navigation</title></head><body><main><p>${"Words from the fully parsed page remain available after its navigation is refused. ".repeat(4)}</p></main><script>
+      document.head.insertAdjacentHTML('beforeend', '<link rel="stylesheet" href="/slow.css">');
+      setTimeout(() => { location.href = '/elsewhere'; }, 50);
+    </script></body></html>`);
+  }
+  if (u === "/slow.css") {
+    setTimeout(() => {
+      res.writeHead(200, { "content-type": "text/css" });
+      res.end("body { color: black; }");
+    }, 1500);
+    return;
+  }
+  if (u === "/navigation-head") {
+    return html(res, `<html><head><script>location.href='/elsewhere'</script></head><body><main><p>${"Words after the head script are still available in the plain read. ".repeat(4)}</p></main></body></html>`);
   }
   if (u === "/file.exe") {
     res.writeHead(200, { "content-type": "application/octet-stream", "content-disposition": "attachment; filename=x.exe" });
@@ -228,6 +245,7 @@ test("W-10: a read that asks while rendering is off gets the plain read and rend
 
 test("W-10: rendering allowed but no Chrome: the plain read, render.status unavailable, and how to enable it", async () => {
   setMode("ask");
+  const chrome = process.env.TIRESIAS_CHROME;
   process.env.TIRESIAS_CHROME = "/nonexistent/chrome";
   try {
     const r = await engine.read(s.url + "/app", { render: true, fresh: true }, ctx);
@@ -236,7 +254,8 @@ test("W-10: rendering allowed but no Chrome: the plain read, render.status unava
     assert.match(r.message ?? "", /install Google Chrome/);
     assert.match(r.message ?? "", /never downloads a browser/);
   } finally {
-    delete process.env.TIRESIAS_CHROME;
+    if (chrome === undefined) delete process.env.TIRESIAS_CHROME;
+    else process.env.TIRESIAS_CHROME = chrome;
   }
 });
 
@@ -302,6 +321,34 @@ test("W-10 hostile page: robots, POST, WebSocket, popups, frames, images, files,
   for (const p of ["/secret/data", "/post", "/ws", "/popup", "/frame", "/img.png", "/sw.js", "/worker.js", "/elsewhere"])
     assert.ok(!s.hits.some((h) => h.path === p), `${p} reached the server: ${JSON.stringify(s.hits.map((h) => h.path))}`);
   assert.equal(wsUpgrades, 0);
+  assert.equal(ourChromes(), 0);
+});
+
+test("navigation refused before the load event, DOM complete", { skip: needChrome }, async () => {
+  setMode("ask");
+  s.hits.length = 0;
+  const r = await engine.read(s.url + "/navigation-dom-complete", { render: true }, ctx);
+  assert.equal(r.status, "ok", r.message);
+  assert.equal(r.render?.status, "rendered", JSON.stringify(r.render));
+  assert.ok(r.render!.blocked!.navigation! >= 1, JSON.stringify(r.render));
+  assert.ok(r.render!.ms! < 5000, JSON.stringify(r.render));
+  assert.match(allText(r), /Words from the fully parsed page/);
+  assert.ok(s.hits.some((h) => h.path === "/slow.css"), "the stylesheet was requested");
+  assert.ok(!s.hits.some((h) => h.path === "/elsewhere"), "/elsewhere reached the server");
+  assert.equal(ourChromes(), 0);
+});
+
+test("navigation in the head before the DOM is parsed", { skip: needChrome }, async () => {
+  setMode("ask");
+  s.hits.length = 0;
+  const r = await engine.read(s.url + "/navigation-head", { render: true }, ctx);
+  assert.equal(r.status, "ok", r.message);
+  assert.match(allText(r), /Words after the head script/);
+  assert.ok(!s.hits.some((h) => h.path === "/elsewhere"), "/elsewhere reached the server");
+  assert.ok(r.render?.status === "rendered" || (r.render?.status === "failed" && r.render.reason === "navigated"), JSON.stringify(r.render));
+  assert.notEqual(r.render!.reason, "timeout");
+  assert.ok(r.render!.ms! < 5000, JSON.stringify(r.render));
+  assert.ok(r.render!.blocked!.navigation! >= 1, JSON.stringify(r.render));
   assert.equal(ourChromes(), 0);
 });
 

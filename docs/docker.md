@@ -1,5 +1,10 @@
 # Running Tiresias in Docker (optional, for advanced users)
 
+> **Not tested yet.** The steps below have not been run end to end by the Tiresias project: the maintainers'
+> machine has no Docker runtime (decided 2026-11-01 for v1.1, after a scan of the free runtime came back not
+> green). The image and limits follow Docker's documented behavior, but treat this guide as untested until this
+> note is removed. Reports of what works and what doesn't are welcome as GitHub issues.
+
 **Most people do not need this.** Tiresias already runs its MCP server under its own memory ceiling
 (`TIRESIAS_MEMORY_MB`, default 1024 MB): if the AI app that starts it ever floods it, the server stops cleanly with a
 message, the daily log says so, and the app can start it again.

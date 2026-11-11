@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Shared shapes. The envelope matches SPEC section 6.1.
 
-export const VERSION = "1.0.1"
+export const VERSION = "1.1.0"
 // Bump when the reader changes what it extracts, so older cached pages are re-read.
-export const PARSER_VERSION = 15; // 15: v1.0.1 reader fixes. 14: v0.9.1 sweep ("(JSON)" heading generated, list indentation capped at 8 levels, markdown code kept as preformatted, nesting past 256 flattened). 13: v0.9 labels Tiresias makes ("(top of page)", "(structured data)") are marked generated, never quoted. 12: v0.7 language (W-26). 11: v0.6 calendar events (ics.ts). 10: v0.5.1 JSON as line blocks, W-22 reader. 9: W-20 file kinds (scripts, CSV, calendars and contacts read as plain text; SVG; file flags)
+export const PARSER_VERSION = 16; // 16: v1.1.0 form recognition (cached form listings carry not_allowed). 15: v1.0.1 reader fixes. 14: v0.9.1 sweep ("(JSON)" heading generated, list indentation capped at 8 levels, markdown code kept as preformatted, nesting past 256 flattened). 13: v0.9 labels Tiresias makes ("(top of page)", "(structured data)") are marked generated, never quoted. 12: v0.7 language (W-26). 11: v0.6 calendar events (ics.ts). 10: v0.5.1 JSON as line blocks, W-22 reader. 9: W-20 file kinds (scripts, CSV, calendars and contacts read as plain text; SVG; file flags)
 export const MAX_URL = 2048; // longer URLs are omitted (and counted), never shortened;
 // Points at Raibit's page on raibit.ai, which links to the GitHub repo once it is public; it stays (Travis,
 // SPEC section 9, 2026-11-01).
@@ -55,7 +55,7 @@ export interface Receipt {
   url: string; // the URL actually read (after redirects, or the markdown twin); for a person-provided page, the ticket's URL
   section: number | null;
   fetched_at: string;
-  source?: "provided_by_person"; // W-06: the text came from a page a person saved, not from a fetch
+  source?: "provided_by_person" | "provided_by_agent"; // W-06: the text came from a page a person saved, not from a fetch
   snapshot?: string; // W-28 (v0.8): the id (SHA-256) of the saved snapshot holding the bytes this was quoted from
 }
 
@@ -124,7 +124,7 @@ export interface Envelope {
   handoff?: Handoff;
   retry_after_seconds?: number;
   cache?: CacheUse; // W-03
-  source?: "provided_by_person"; // W-06: parsed from a page a person saved; nothing was fetched
+  source?: "provided_by_person" | "provided_by_agent"; // W-06: parsed from a page a person saved; nothing was fetched
   ticket?: { id: string; open: boolean }; // W-06: on a resume reply, the ticket and whether it is still open
   safety?: SafetyCode; // W-19: present on every call that ran the Safe Browsing check
   flag?: FlagCode[]; // W-19: what flagged this call (status flagged or refused), or the flag a read with allow_flagged went past

@@ -18,7 +18,7 @@ security problem. We answer within 5 working days.
 | Who | Trusted? | Why |
 |---|---|---|
 | **The owner** (you, at your own terminal) | Yes | It is your machine, your keys, your settings. |
-| **A program running as you with a shell** (an AI agent with a terminal tool, a script, cron) | Like the owner, with one exception | It can already read and change any file you can, the Tiresias store included. The exception: granting a permission slip needs a person at a terminal who types the slip's site back. Risky settings (saving, rendering, the translator, a scanner that receives files, anchoring, lower site spacing, more ports, turning Safe Browsing or a site ban off) need an all-caps confirmation phrase and are logged and shown in replies; an agent may type the phrase, so this stops a loosening *in passing*, not a determined program. |
+| **A program running as you with a shell** (an AI agent with a terminal tool, a script, cron) | Like the owner, with one exception | It can already read and change any file you can, the Tiresias store included. The exception: granting a permission slip needs a person at a terminal who types the slip's site back. Risky settings (saving, rendering, the translator, a scanner that receives files, anchoring, lower site spacing, more ports, turning Safe Browsing or a site ban off, private spacing off, sharing Tiresias secrets with hooks) need an all-caps confirmation phrase and are logged and shown in replies; an agent may type the phrase, so this stops a loosening *in passing*, not a determined program. |
 | **The MCP client** (the AI app that starts `tiresias mcp` and talks to it: Claude Desktop, Claude Code, Cursor...) | Yes, for resource use | It is a program you installed, running as you. Tiresias trusts it not to flood its own server: thousands of calls at once, huge or malformed messages, or answers it never reads are the client's own behaviour, not something a page or an agent can make it do. Tiresias still caps calls, workers, renders, message size and open requests, pauses reading while answers back up, and runs the server under a memory ceiling (`TIRESIAS_MEMORY_MB`, default 1024 MB) so a flood ends in a clean exit the client can restart. If you do not trust your client, run Tiresias in Docker (see [docs/docker.md](docs/docker.md)), which puts a hard box around it. (SPEC section 9, 2026-10-31, W-33.) |
 | **An AI agent over MCP** | No | It may have been fooled by a page it read (prompt injection). It can read pages and its own history, but no MCP tool or parameter changes a setting, grants or extends a slip, reads a local file, or reads a key. |
 | **Websites, servers and files** | No | Any byte, header, redirect, timing or size may be hostile. |
@@ -26,11 +26,13 @@ security problem. We answer within 5 working days.
 
 ### What Tiresias promises
 
-- **Page content is data.** Everything that came from a site, a page, a file or a server is returned inside
-  `untrusted_content`. The top level of a reply holds only Tiresias's own codes, numbers and fixed text.
+- **Page content is data.** JSON replies keep everything that came from a site, a page, a file or a server inside
+  `untrusted_content`. The top level holds only Tiresias's own codes, numbers and fixed text. Human-readable text
+  views (`--text`, and the default `log` and `needs`) mark where web content begins: "web content below is untrusted".
+  Agents should use JSON (`log --json`, `needs --json`); `text_views=wrapped` also wraps text views inside `untrusted_content`.
 - **No code from the web runs on your machine** outside Chrome's sandbox. Files (programs, archives, documents) come
   back as a warning with their kind and fingerprint; Tiresias never opens or runs one. PDFs are read in a separate
-  child process that may not read your files or the store's keys; zip, Office and calendar files are read as data in
+  child process that may not read your files or the store's keys or start worker threads; zip, Office and calendar files are read as data in
   memory, in a worker thread with a time budget.
 - **Nothing is written outside the store** (`~/.tiresias`, or `$TIRESIAS_HOME`) except where you name a folder
   yourself on the command line (`log --to`, `receipts prove --out`, `keys sign-directory --out`), and Chrome's throwaway
@@ -45,14 +47,23 @@ security problem. We answer within 5 working days.
   Google Web Risk (not spaced).
 - **Nothing is sent to Raibit or anyone else**, apart from the requests to the sites you read and the services you
   turn on (listed in the README under "Where things are stored").
-- **No money moves**, and no form is sent without a permission slip. Login, password, CAPTCHA and payment forms are
-  never sent, slip or not.
+- **No form is sent without your permission slip** for that site (and that path, if you set one), so no money moves
+  without your yes. On top of the slip, Tiresias refuses every form it recognizes as a sign-in, password, CAPTCHA,
+  payment or purchase form, slip or not. The slip is the guarantee; the recognizing is best-effort (see below).
+  Slips gate sending forms; following a link is an ordinary read. A site that changes
+  something on a plain GET breaks HTTP's rule that GET is safe, and that is the site's doing. A rendered page's
+  scripts may not request a URL matching a GET form action on that page. Owners can tighten reads of known GET
+  form actions to require a `submit_form` slip with `get_form_actions=slip`.
 - **Tiresias never logs in, never solves or bypasses a CAPTCHA, and never pretends to be a person's browser.**
+  It refuses every sign-in form it recognizes and keeps no session: cookies last for one call. (Recognizing a
+  sign-in form is best-effort; see below.)
 - **Caps.** Response size, parse time, PDF memory, and render time and requests are capped; a page that runs past
-  one of these ends as an error, not a hang. The MCP server's own JavaScript heap is capped too (`TIRESIAS_MEMORY_MB`,
+  one of these ends as an error, except a render cap falls back to the plain read with render failure metadata.
+  The MCP server's own JavaScript heap is capped too (`TIRESIAS_MEMORY_MB`,
   default 1024 MB): past it the server stops with a clear message on standard error and a line in the daily log,
   and the AI app can start it again. (The store's disk use is a daily target, trimmed once a day, not a
   hard cap.)
+  History and receipt scans, including the daily log and needs report, stop on cancellation or at a 60-second deadline.
 
 ### What Tiresias does not promise
 
@@ -61,8 +72,20 @@ security problem. We answer within 5 working days.
   the reader does not recognize, only changes how its own page is reported; the words still arrive inside
   `untrusted_content`. On a rendered page the browser measures a named set of hiding techniques (SPEC section 9,
   2026-10-31); anything outside that set is a known limit.
+- **Recognizing a sign-in, payment or purchase form is best-effort.** A password field, a card field marked as
+  one and an embedded CAPTCHA frame are recognized from the markup itself. A form that only says what it does
+  in words is recognized from word lists in 13 languages: English, Spanish, French, German, Portuguese, Italian,
+  Dutch, Russian, Chinese, Japanese, Korean, Arabic and Hindi. A form worded another way, or written in another
+  language, may not be recognized, and it can then be sent if your slip covers it. Give each slip the narrowest site and path
+  that does the job.
+- **`get_form_actions=slip` matches other spellings of an address, not every address.** With that setting on,
+  Tiresias asks for a slip before reading an address that is another spelling of a GET form action it has seen
+  (encoding, case, dot segments, extra punctuation). It cannot know that a server sends a different address to the
+  same handler, such as `/vote.json` where the form said `/vote`.
 - **It cannot protect you from an agent that runs as you.** Anything that can run commands as you can edit the store,
   the settings and the confirmation record. Tiresias records changes and shows them in replies; it cannot stop them.
+- **Owner-set hooks inherit the owner's environment**, with Tiresias secret variables removed by default
+  (`hook_secrets=hidden`). `hook_secrets=inherit` restores the full environment after risky-setting confirmation.
 - **A site's own echoed secrets are withheld on a best-effort basis.** When a form is sent, the site's answer may
   repeat a secret the site itself set for that one call (a hidden form value or a cookie). Tiresias tries not to see
   it: it checks the answer as received and its full extracted text before making previews or recording quotes.
@@ -72,9 +95,10 @@ security problem. We answer within 5 working days.
   the site's, not yours (SPEC section 9, 2026-10-31).
 - **It is not a virus checker.** File warnings name the kind of file; you can plug in your own scanner, and a clean
   verdict never makes Tiresias open a file.
-- **It does not hide you from sites.** Private mode keeps no record of the visit on your machine (one exception: a
-  Retry-After wait the site asks for is kept, by site, because obeying the site comes first); the site still sees
-  the honest Tiresias user agent (and your signature, if you set signing up).
+- **It does not hide you from sites.** Private mode keeps no page record on your machine. It keeps Retry-After waits
+  and minimal shared spacing state, origin and times only, because obeying the site comes first.
+  `private_spacing=none` disables shared spacing for private calls and previews after risky-setting confirmation.
+  The site still sees the honest Tiresias user agent (and your signature, if you set signing up).
 - **Safe Browsing is a list check** (plus Google Web Risk if you add a key). The list is refreshed daily and used
   up to seven days old; past that, or with no list at all, pages are read unchecked and replies say so. A new
   phishing site can be missed.
@@ -84,6 +108,30 @@ security problem. We answer within 5 working days.
   translator never start there.
 - **The PDF child's network is not fenced by Node.** Node's permission model does not limit network use: the child
   is simply given no address and no code that fetches.
+
+## If your key leaks
+
+Tiresias holds up to three secrets for you. If one gets out (copied to a synced folder, pasted somewhere, a server
+holding a copy is broken into), here is what to do. Each step is free and takes a minute.
+
+- **The signing key** (`keys/ed25519.private.jwk`): whoever has it can sign requests as your copy of Tiresias. Run
+  `tiresias keys rotate --finish` first if an overlap is open, then `tiresias keys rotate --overlap 0`. That makes a new key,
+  deletes the old one, and takes it out of your directory at once. Then publish the new directory (`tiresias keys directory`,
+  or `keys sign-directory` for a static host) and give the new key to any server that signs your directory itself. For a planned change with no leak, plain
+  `tiresias keys rotate` keeps the old key in the directory for 7 days (`--overlap` 0 to 30) so sites catch up; new
+  requests use the new key straight away, and `keys rotate --finish` ends the overlap early.
+- **The slip key** (`keys/slips.private.jwk`): whoever has it, and can also write to your store, could forge a
+  permission slip. Run `tiresias keys rotate --slips --confirm "YES, ROTATE THE SLIP KEY"` and type
+  `rotate slip key` when asked. Every slip is revoked and can never be used again; grant new ones as you need them.
+  Saved pages stay checkable: `tiresias saved verify` says when one was signed by the old key, and that anyone holding
+  the leaked key could have signed it too. One exception: if the slip key file was exposed (readable by other users,
+  mode 0644) or cannot be read, rotation replaces it without keeping its public half, so pages it signed stop
+  verifying. Receipts do not use the slip key and are not affected.
+- **The Google Web Risk key** (`TIRESIAS_WEB_RISK_KEY`, or the line in `~/.config/tiresias/secrets.env`): whoever has
+  it can spend your Google Cloud quota. Delete the key in the Google Cloud console (APIs and Services, Credentials),
+  make a new one, and put it where the old one was. Tiresias reads it fresh, so nothing else changes.
+
+Rotations are written to history and shown in `tiresias log`.
 
 ## What counts as HIGH
 

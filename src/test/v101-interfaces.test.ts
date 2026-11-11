@@ -95,7 +95,7 @@ test("unrelated invalid storage limits do not prevent ticket resume", async () =
     const before = s.hits.length;
     const reply = await resume(provided.id, { text: "<h1>Report</h1><p>Provided text.</p>" });
     assert.equal(reply.status, "ok");
-    assert.equal(reply.source, "provided_by_person");
+    assert.equal(reply.source, "provided_by_agent");
     assert.equal(s.hits.length, before);
     fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ keep_handoff_days: 0 }));
     assert.throws(keepDays, /keep_handoff_days/);

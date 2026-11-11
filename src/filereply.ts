@@ -17,7 +17,9 @@ import type { CacheEntry } from "./pagecache.js";
 import { MAX_BLOCK } from "./reader.js";
 import { MAX_SAMPLE, detect, stampLanguage } from "./lang.js";
 import { translateReply } from "./translate.js";
-import { SecretWithheld, valueHoldsSecret, type Secrets } from "./echo.js";
+import { SecretWithheld, noSecrets, valueHoldsSecret, type Secrets } from "./echo.js";
+
+import { runUntrusted } from "./sandbox.js";
 
 import { BUDGET, CallMeta, Opts, Uc, env } from "./envelope.js";
 
@@ -53,7 +55,7 @@ export function fileOptions(): FileOptions {
 
 // The reply for a file. The scanner hook (W-21) runs here, on a high-risk file with a fingerprint; its
 // quarantine copy is deleted as soon as the hook is done. Recorded in the receipts log (W-20) unless private.
-export async function fileWarning(url: string, finalUrl: string, f: FileFacts, meta: CallMeta, agent: string | undefined, source?: "provided_by_person", opts: Opts = {}, secrets?: Secrets, saveSnapshot?: () => string | undefined): Promise<Envelope> {
+export async function fileWarning(url: string, finalUrl: string, f: FileFacts, meta: CallMeta, agent: string | undefined, source?: "provided_by_person" | "provided_by_agent", opts: Opts = {}, secrets?: Secrets, saveSnapshot?: () => string | undefined): Promise<Envelope> {
   try {
     const fw: FileWarning = {
       kind: f.kind, risk: f.risk, size: f.size,
@@ -86,6 +88,10 @@ export async function fileWarning(url: string, finalUrl: string, f: FileFacts, m
     }
     // v0.6: inside a zip or an Office file, in the worker, without unpacking it (inside.ts).
     const ins = await inspectFile(f);
+    if (ins?.office_text && !noSecrets(secrets)) {
+      const texts = [JSON.stringify(ins.office_text), ins.office_text.map((s) => s.text).join("\n")];
+      if (await runUntrusted<boolean>({ op: "echo", texts, secrets: secrets! }, Infinity)) throw new SecretWithheld();
+    }
     if (macroByName(f) || ins?.macros) fw.flags = [...new Set([...fw.flags, "macros" as const])];
     if (ins) {
       fw.inside = ins.top;
@@ -292,7 +298,7 @@ export function officePage(secs: { heading: string; text: string }[]): ParsedPag
 // Fills untrusted_content.inside for this call and returns its receipts. The first look (no question, section
 // or page) keeps the budgeted sections and quotes each one; otherwise the answer is the page reader's own
 // (buildContent): passages, one section page, or a page of the outline.
-async function officeContent(e: Envelope, secs: { heading: string; text: string }[], finalUrl: string, opts: Opts, meta: CallMeta, source?: "provided_by_person"): Promise<Receipt[]> {
+async function officeContent(e: Envelope, secs: { heading: string; text: string }[], finalUrl: string, opts: Opts, meta: CallMeta, source?: "provided_by_person" | "provided_by_agent"): Promise<Receipt[]> {
   const ins = (e.untrusted_content as Uc | null)?.inside as Record<string, unknown> | undefined;
   if (!ins) return [];
   const now = new Date().toISOString();

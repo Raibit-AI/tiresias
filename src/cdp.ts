@@ -7,6 +7,7 @@ import type { Readable, Writable } from "node:stream";
 
 export const MAX_MESSAGE = 64 * 1024 * 1024; // the largest single message accepted from Chrome
 export const MAX_PENDING = 1_000; // commands waiting for an answer at once
+export const MAX_REQUEST_METADATA = 16 * 1024;
 
 export class CdpError extends Error {
   constructor(message: string, readonly code: "closed" | "timeout" | "protocol" | "too_large") {
@@ -79,7 +80,26 @@ export class Cdp {
       return;
     }
     if (typeof m.method === "string") {
-      const e: CdpEvent = { method: m.method, params: m.params ?? {}, ...(typeof m.sessionId === "string" ? { sessionId: m.sessionId } : {}) };
+      let params = m.params ?? {};
+      if (m.method === "Fetch.requestPaused") {
+        // Async fetches must never retain the page's arbitrary headers, postData or other request data.
+        const p = params, r = p.request ?? {};
+        const fields = [p.requestId, m.sessionId ?? "", p.frameId ?? "", p.resourceType ?? "", r.url ?? "", r.method ?? ""];
+        const limits = [256, 256, 256, 32, 8192, 16];
+        if (fields.some((v, i) => typeof v !== "string" || v.length > limits[i]))
+          return this.fail(new CdpError("The browser sent too much request metadata.", "too_large"));
+        const headers: Record<string, string> = {};
+        if (p.resourceType === "Preflight") for (const name of ["Access-Control-Request-Method", "Origin", "Access-Control-Request-Headers"]) {
+          const value = r.headers?.[name] ?? r.headers?.[name.toLowerCase()] ?? "";
+          if (typeof value !== "string" || value.length > 2048)
+            return this.fail(new CdpError("The browser sent too much request metadata.", "too_large"));
+          headers[name] = value;
+        }
+        params = { requestId: p.requestId, frameId: p.frameId, resourceType: p.resourceType, request: { url: r.url, method: r.method, headers } };
+        if (Buffer.byteLength(JSON.stringify(params), "utf8") > MAX_REQUEST_METADATA)
+          return this.fail(new CdpError("The browser sent too much request metadata.", "too_large"));
+      }
+      const e: CdpEvent = { method: m.method, params, ...(typeof m.sessionId === "string" ? { sessionId: m.sessionId } : {}) };
       for (const l of [...this.listeners]) {
         try {
           l(e);

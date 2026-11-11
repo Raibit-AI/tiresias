@@ -42,7 +42,7 @@ export interface CallMeta {
   changed?: boolean; // check: the page changed compared with a kept copy (not set on a first visit or in private mode)
   cache?: CacheUse; // W-03
   ticket?: "created" | "refused_cap"; // W-06: a read stopped at a wall
-  source?: "provided_by_person"; // W-06: a resume with a page a person saved
+  source?: "provided_by_person" | "provided_by_agent"; // W-06: a resume with a page a person saved
   flag?: "phishing_list" | "web_risk"; // W-19: the call was flagged (or read past a flag with allow_flagged)
   slip?: string; // W-04: the permission slip a form submit used
   file_kind?: FileKind; // W-20: the call ended in a file warning of this kind
@@ -269,7 +269,7 @@ export async function guarded(...args: Parameters<typeof guardedCall>): Promise<
   } catch (e) {
     configError = e;
   }
-  return callContext.run({ ...callContext.getStore(), config, configError }, () => guardedCall(...args));
+  return callContext.run({ ...callContext.getStore(), config, configError, getActions: undefined }, () => guardedCall(...args));
 }
 
 async function guardedCall(

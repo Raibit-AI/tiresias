@@ -15,7 +15,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes, sign as edSign, verify as edVerify } from "node:crypto";
-import { ensureSlipKey, readSlipKey } from "./keys.js";
+import { ensureSlipKey, readSlipKey, retiredSlipKeys } from "./keys.js";
 import { releaseLock, stillOwned, takeLock } from "./savedlock.js";
 import { bound as boundReceipt } from "./receipts.js";
 import { DEFAULT_LIMITS, loadLimits, loadSavingMode, type Limits } from "./config.js";
@@ -517,7 +517,8 @@ export interface VerifyResult {
   ok: boolean;
   manifest: "ok" | "damaged";
   id_matches?: boolean;
-  signature?: "ok" | "bad" | "no_key";
+  signature?: "ok" | "retired_key" | "bad" | "no_key";
+  retired_key_at?: string; // v1.1: signed by a slip key this profile retired at that time (keys rotate --slips)
   files?: { name: string; ok: boolean; problem?: "missing" | "size" | "hash" }[];
   extra_files?: number;
   receipts?: { n: number; snapshot_matches: boolean; quote: QuoteCheck }[];
@@ -557,16 +558,28 @@ export async function verify(idOrPrefix: string): Promise<VerifyResult> {
   const m = readManifest(dir);
   if (m === "damaged") return { id, ok: false, manifest: "damaged", message: "The manifest is damaged or not one of Tiresias's: this snapshot cannot be trusted." };
   const idMatches = m.id === id && snapshotId(m) === id;
-  let signature: "ok" | "bad" | "no_key" = "bad";
+  let signature: "ok" | "retired_key" | "bad" | "no_key" = "bad";
+  let retiredAt: string | undefined;
+  const sig = Buffer.from(m.sig, "base64url");
+  const sigOk = sig.length === 64 && sig.toString("base64url") === m.sig;
   try {
     const keys = readSlipKey();
     if (!keys) signature = "no_key";
-    else {
-      const sig = Buffer.from(m.sig, "base64url");
-      signature = sig.length === 64 && sig.toString("base64url") === m.sig && edVerify(null, signedBytes(m), keys.pub, sig) ? "ok" : "bad";
-    }
+    else signature = sigOk && edVerify(null, signedBytes(m), keys.pub, sig) ? "ok" : "bad";
   } catch {
     signature = "no_key";
+  }
+  // v1.1: a snapshot signed before `keys rotate --slips` is checked against the retired public halves.
+  if (signature !== "ok" && sigOk) {
+    try {
+      const hit = retiredSlipKeys().find((k) => edVerify(null, signedBytes(m), k.pub, sig));
+      if (hit) {
+        signature = "retired_key";
+        retiredAt = hit.retired_at;
+      }
+    } catch {
+      // the retired list cannot be read: the result stays as it was
+    }
   }
   const parts = new Map<string, Buffer>();
   const files = m.files.map((f) => {
@@ -586,7 +599,7 @@ export async function verify(idOrPrefix: string): Promise<VerifyResult> {
   // (Codex v0.8 round 1: a planted manifest must not choose work for the reader).
   let texts: string[] | null = null;
   let why: VerifyResult["quotes_unchecked_reason"];
-  if (m.receipts.length && (!idMatches || signature !== "ok" || !filesOk)) why = "not_authentic";
+  if (m.receipts.length && (!idMatches || !(signature === "ok" || signature === "retired_key") || !filesOk)) why = "not_authentic";
   else if (m.receipts.length && m.files.length) {
     try {
       texts = await readerTexts(m, parts);
@@ -603,7 +616,8 @@ export async function verify(idOrPrefix: string): Promise<VerifyResult> {
     quote: (texts ? (texts.some((t) => r.quote.length <= t.length && t.includes(r.quote)) ? "found" : "not_found") : "not_checked") as QuoteCheck,
   }));
   const quotesOk = receipts.every((r) => r.snapshot_matches && r.quote === "found");
-  const ok = idMatches && signature === "ok" && filesOk && !unreadable && extra === 0 && quotesOk;
+  const signed = signature === "ok" || signature === "retired_key";
+  const ok = idMatches && signed && filesOk && !unreadable && extra === 0 && quotesOk;
   const reader = m.parser === PARSER_VERSION ? "same" : "different";
   const problems = [
     !idMatches && "the id does not match the manifest",
@@ -617,9 +631,9 @@ export async function verify(idOrPrefix: string): Promise<VerifyResult> {
     receipts.some((r) => r.quote === "not_checked") && "some quotes could not be checked",
   ].filter((x): x is string => !!x);
   return {
-    id, ok, manifest: "ok", id_matches: idMatches, signature, files, ...(extra ? { extra_files: extra } : {}), ...(unreadable ? { folder: "unreadable" as const } : {}), receipts, reader, ...(why ? { quotes_unchecked_reason: why } : {}),
+    id, ok, manifest: "ok", id_matches: idMatches, signature, ...(retiredAt ? { retired_key_at: retiredAt } : {}), files, ...(extra ? { extra_files: extra } : {}), ...(unreadable ? { folder: "unreadable" as const } : {}), receipts, reader, ...(why ? { quotes_unchecked_reason: why } : {}),
     message: ok
-      ? `Verified: the signature, the id and every saved file match, and all ${receipts.length} quotes are in the saved bytes.`
+      ? `Verified: the signature, the id and every saved file match, and all ${receipts.length} quotes are in the saved bytes.${retiredAt ? ` The signature is by this profile's earlier slip key, retired on ${retiredAt} (tiresias keys rotate --slips); if that key had leaked, someone holding it could also have made this snapshot.` : ""}`
       : `Not verified: ${problems.join("; ")}.`,
   };
 }

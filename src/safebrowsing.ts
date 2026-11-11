@@ -24,7 +24,7 @@ import os from "node:os";
 import path from "node:path";
 import { ConfigError, loadSafetyConfig } from "./config.js";
 import { ENV_PHRASE, envMayLoosen } from "./confirm.js";
-import { FetchError, Flagged, SafeBrowsingError } from "./errors.js";
+import { FetchError, Flagged, SafeBrowsingError, SafetyError } from "./errors.js";
 import { politeFetch } from "./fetcher.js";
 import { callContext } from "./context.js";
 import { indexList, lookup, type Indexed, type Normalized } from "./safelist.js";
@@ -476,7 +476,7 @@ async function webRisk(url: string, key: string, priv: boolean, signal: AbortSig
     if (res.status !== 200 || !res.body) return { state: "unavailable" };
     parsed = JSON.parse(res.body.toString("utf8"));
   } catch (e) {
-    if (e instanceof SafeBrowsingError) throw e; // a bad test endpoint setting: loud
+    if (e instanceof SafeBrowsingError || e instanceof SafetyError) throw e; // policy refusals are never "unavailable"
     if (cancelled()) throw new FetchError("The request was cancelled.", "cancelled");
     return { state: "unavailable" }; // never keep the error (its text could hold the request URL); a timeout lands here too
   } finally {

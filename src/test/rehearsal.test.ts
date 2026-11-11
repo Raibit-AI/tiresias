@@ -57,14 +57,14 @@ test("9.20: failed snapshot and receipt verification use the normal CLI error st
   }
 });
 
-test("9.28: history and receipts text listings start with counts and pagination", async () => {
+test("9.28: history and receipts text listings mark web content before counts and pagination", async () => {
   freshHome();
   const history = await import("../history.js");
   const receipts = await import("../receipts.js");
   for (const name of ["history", "receipts"]) {
     const empty = cli([name, "--text"]);
     assert.equal(empty.status, 0, empty.stderr);
-    assert.equal(empty.stdout.split("\n")[0], `${name === "history" ? "History" : "Receipts"}: 0 records, page 1 of 1`);
+    assert.equal(empty.stdout.split("\n")[1], `${name === "history" ? "History" : "Receipts"}: 0 records, page 1 of 1`);
     assert.doesNotMatch(empty.stdout, /door: none/);
   }
   for (let i = 0; i < 12; i++) {
@@ -78,7 +78,7 @@ test("9.28: history and receipts text listings start with counts and pagination"
     const page = name === "receipts" ? 2 : 1;
     const r = cli([name, "--text", "--page", String(page)]);
     assert.equal(r.status, 0, r.stderr);
-    assert.equal(r.stdout.split("\n")[0], `${name === "history" ? "History" : "Receipts"}: 12 records, page ${page} of ${e.pages}`);
+    assert.equal(r.stdout.split("\n")[1], `${name === "history" ? "History" : "Receipts"}: 12 records, page ${page} of ${e.pages}`);
     assert.match(r.stdout, /listing\.example/);
     assert.doesNotMatch(r.stdout, /door: none/);
   }

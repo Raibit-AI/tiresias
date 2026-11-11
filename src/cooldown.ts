@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// N-06: Retry-After is enforced, not just reported. When a site says 429 or
-// 503, we remember "do not call this origin until T", across processes, and
+// N-06: Retry-After is enforced, not just reported. When a site says 429,
+// 503 or asks for a wait on a redirect, we remember "do not call this origin until T", across processes, and
 // every later request (page, probe, robots refresh) checks it first.
 //
 // Storage is an append-only log with no lock. A lock cannot be made safe
@@ -13,7 +13,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { canonOrigin } from "./sitekey.js";
-import { appendLine, cachePath, readJson, readLogSync, rootDir } from "./store.js";
+import { Refused } from "./errors.js";
+import { appendLine, cachePath, readJson, scanLogSync, rootDir, type LogCursor } from "./store.js";
 
 // A wait over 10 years is not a real Retry-After. It is treated as invalid and
 // replaced by a fixed 24 hour cooldown. Anything below that limit is kept in
@@ -70,8 +71,7 @@ interface Entry {
 }
 const mem = new Map<string, number>(); // cooldowns set by this process (at most MEM_MAX)
 // v0.9 hardening (Codex round 6c, HIGH): `mem` no longer keeps every wait for the server's whole life: past MEM_MAX
-// entries, the expired ones are dropped. A wait that has not ended is never dropped (Codex round 7c: the shared file
-// is read only from its last 8 MiB, so it cannot stand in for one).
+// entries, the expired ones are dropped. A wait that has not ended is never dropped.
 // v0.9 client trust (Travis approved, 2026-10-31; closes the class stopped in client-trust round 1): when `mem` is
 // full of waits that have not ended, a new one goes into a FIXED-SIZE store instead of growing memory: SLOTS
 // deadlines (8 MB), each origin written to K slots chosen by a keyed hash (a random key per process, so a site cannot
@@ -122,10 +122,16 @@ function remember(origin: string, until: number): void {
 export const cooldownStoreBytes = () => sketch?.byteLength ?? 0; // for tests
 export const cooldownMemSize = () => mem.size; // for tests
 
-// v0.5.1: the log is read again only when one of its files changed (size, mtime or inode), not on every
-// check (a request checks about eleven times). The stamp names the store root, so a new TIRESIAS_HOME
-// is read afresh.
-let memo: { stamp: string; map: Map<string, number> } | null = null;
+// Check stamps on each request, retaining the replayed index and reading only new bytes when a log
+// grows. A replaced or shrunken log is replayed; remembered waits still expire normally. The stamp
+// names the store root, so a new TIRESIAS_HOME is read afresh.
+interface Index {
+  get: (origin: string) => number;
+  exact: (origin: string) => number;
+  take: (origin: unknown, until: unknown) => void;
+  logs: Map<string, LogCursor | undefined>;
+}
+let memo: { root: string; stamp: string; map: Index } | null = null;
 let reads = 0;
 export const loadCount = () => reads; // for tests
 function stamp(): string {
@@ -133,8 +139,9 @@ function stamp(): string {
   for (const f of [path.join(rootDir(), CUR), path.join(rootDir(), LEGACY_OLD), safePath(() => cachePath(LEGACY, "shared"))]) {
     try {
       const st = f ? fs.lstatSync(f) : null;
-      parts.push(st ? `${st.size}:${st.mtimeMs}:${st.ino}` : "-");
-    } catch {
+      parts.push(st ? `${st.size}:${st.mtimeMs}:${st.ctimeMs}:${st.dev}:${st.ino}:${st.mode}` : "-");
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
       parts.push("-");
     }
   }
@@ -147,35 +154,57 @@ const safePath = (f: () => string): string | null => {
     return null;
   }
 };
-function load(): Map<string, number> {
-  const st = stamp();
-  if (memo && memo.stamp === st) return memo.map;
-  const map = loadNow();
-  memo = { stamp: st, map };
-  return map;
+function load(): Index {
+  try {
+    const st = stamp();
+    if (memo && memo.stamp === st) return memo.map;
+    const root = rootDir();
+    const map = loadNow(memo?.root === root ? memo.map : undefined);
+    memo = { root, stamp: st, map };
+    return map;
+  } catch {
+    memo = null;
+    throw new Refused("The site's Retry-After waits could not be read. No request was sent.");
+  }
 }
 
-// Latest deadline per origin. Expired and malformed entries are ignored; there
-// is no cap on the number of origins. Only the last 8 MB of the log is read.
-function loadNow(): Map<string, number> {
-  reads++;
-  const now = Date.now();
+// Replay every live deadline. Overflow uses the same bounded, conservative slots as the in-process list.
+function newIndex(): Index {
   const best = new Map<string, number>();
+  let overflow: Float64Array | null = null;
   const take = (origin: unknown, until: unknown) => {
-    if (typeof origin !== "string" || typeof until !== "number" || !Number.isFinite(until) || until <= now) return;
+    if (typeof origin !== "string" || typeof until !== "number" || !Number.isFinite(until) || until <= Date.now()) return;
     const key = canonOrigin(origin); // v0.6: one name per site (sitekey.ts)
-    if (until > (best.get(key) ?? 0)) best.set(key, until);
+    if (best.has(key) || (best.size < MEM_MAX && key.length <= MAX_ORIGIN)) {
+      if (until > (best.get(key) ?? 0)) best.set(key, until);
+    } else {
+      overflow ??= new Float64Array(SLOTS);
+      for (const i of slotsOf(key)) if (until > overflow[i]) overflow[i] = until;
+    }
   };
+  return {
+    take,
+    logs: new Map(),
+    exact: (origin) => best.get(origin) ?? 0,
+    get: (origin) => {
+      let least = Infinity;
+      if (overflow) for (const i of slotsOf(origin)) least = Math.min(least, overflow[i]);
+      return Math.max(best.get(origin) ?? 0, least === Infinity ? 0 : least);
+    },
+  };
+}
+
+function loadNow(index = newIndex()): Index {
+  reads++;
   let legacy: Record<string, unknown> | null = null;
   try {
     legacy = readJson<Record<string, unknown>>(cachePath(LEGACY, "shared")); // W-18: shared, at the root
   } catch {
     // the root's cache/ is a link or someone else's: the legacy store is not read (Codex round 46)
   }
-  if (legacy && typeof legacy === "object") for (const [o, u] of Object.entries(legacy)) take(o, u);
-  for (const e of readLogSync<Entry>(LEGACY_OLD)) take(e?.origin, e?.until); // v0.1.4 rotated file, read only
-  for (const e of readLogSync<Entry>(CUR)) take(e?.origin, e?.until);
-  return best;
+  if (legacy && typeof legacy === "object") for (const [origin, until] of Object.entries(legacy)) index.take(origin, until);
+  for (const name of [LEGACY_OLD, CUR]) index.logs.set(name, scanLogSync<Entry>(name, (e) => index.take(e?.origin, e?.until), index.logs.get(name)));
+  return index;
 }
 
 // Fetchers register here so queued requests can be cancelled the moment a
@@ -188,7 +217,7 @@ export function setCooldown(origin: string, status: number, header: string | nul
   const until = Date.now() + seconds * 1000;
   // Exact sources only: the fixed-size store may answer later than the truth (a collision), and taking that as
   // "already written" would keep the line from other processes.
-  const known = Math.max(mem.get(origin) ?? 0, load().get(origin) ?? 0);
+  const known = Math.max(mem.get(origin) ?? 0, load().exact(origin));
   remember(origin, until); // this process honors it at once
   // Only a later deadline is worth a line. Never shortens anything.
   if (until > known && origin.length <= MAX_ORIGIN) appendLine(CUR, { v: 1, origin, until }); // shared, at the root only: private mode may write nothing else

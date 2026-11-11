@@ -36,7 +36,7 @@ import { SlipError } from "./errors.js";
 import { PATH_RE, pathAllowed } from "./forms.js";
 import { readItem, writeItem } from "./itemfiles.js";
 import * as history from "./history.js";
-import { ensureSlipKey, readSlipKey, type SlipKeys } from "./keys.js";
+import { SLIP_KEY_FILE, ensureSlipKey, readSlipKey, replaceSlipKey, type SlipKeys } from "./keys.js";
 import { NOFOLLOW, NONBLOCK, cliSafeId, isPrivate, ownFile, profileName, randomTmp, rmRegular, subDir } from "./store.js";
 
 export { SlipError };
@@ -498,6 +498,37 @@ export function revokeAll(priv = false): number {
   return n;
 }
 
+// ---- v1.1 workstream 4: rotating the slip key ----
+// A new slip key makes every existing slip fail its signature check, so the rotation revokes them all, cleanly and
+// on the record (revoked.jsonl), before the key is replaced, and once more after it (a slip granted meanwhile was
+// signed by the old key). Saved pages are not touched: the old key's public half is kept for `saved verify`.
+// Receipts never reference the slip key (a receipt names a snapshot by its SHA-256 id). An irreversible action, so
+// it always needs its phrase, even with confirmations for risky settings turned off; the CLI also asks a person at
+// a terminal to type "rotate slip key", like `slip revoke --all`. Written to history (tool "keys").
+export const ROTATE_SLIP_PHRASE = "YES, ROTATE THE SLIP KEY";
+
+export function checkRotatePhrase(confirm: string | undefined): void {
+  if (confirm !== ROTATE_SLIP_PHRASE)
+    throw new SlipError(`Rotating the slip key revokes every permission slip of this profile, and saved pages signed before it are then checked against the old key's public half. It needs the exact confirmation ${JSON.stringify(ROTATE_SLIP_PHRASE)}. Run it again with: tiresias keys rotate --slips --confirm '${ROTATE_SLIP_PHRASE}'  (type it exactly, in capitals; it is recorded in history). Nothing was changed.`);
+}
+
+export function rotateSlipKey(confirm: string | undefined, priv = false, now = Date.now()): { revoked: number; retired: boolean } {
+  if (priv || isPrivate()) throw new SlipError("Private mode: nothing is written, so the slip key is not rotated.");
+  checkRotatePhrase(confirm);
+  const d = subDir("keys", false);
+  if (!d || !fs.lstatSync(path.join(d, SLIP_KEY_FILE), { throwIfNoEntry: false }))
+    throw new SlipError("There is no slip key yet, so there is nothing to rotate. One is made by the first slip grant or saved page.");
+  // The slips are revoked inside replaceSlipKey, after every refusal (synced folder, another rotation, a full retired
+  // list), so a refused rotation never destroys them (Codex K.4).
+  let revoked = 0;
+  const r = replaceSlipKey(now, () => {
+    revoked = revokeAll(priv);
+  });
+  revoked += revokeAll(priv);
+  history.record({ time: new Date(now).toISOString(), tool: "keys", url: "", agent: "cli", status: "ok", door: "none", event: "slip_key_rotated", revoked, by: process.stdin.isTTY === true ? "terminal" : "not_terminal" });
+  return { revoked, retired: r.retired };
+}
+
 // A use file is deleted on its own only when its slip file is confirmed gone at that moment. A slip
 // granted (and claimed) after any listing was made still has its <id>.json, so its uses are never
 // touched (Codex round 49: a final sweep deleted a new slip's use and gave the use back). Uses only
@@ -688,4 +719,17 @@ export function claimSlip(
     }
   }
   return no("no_slip");
+}
+
+// A claimed use stays spent, but may leave the queue only while its slip still permits this target.
+export function claimedStillValid(claim: { slip_id: string; use: number }, action: string, url: string): boolean {
+  const t = target(url);
+  const d = subDir("slips", false);
+  if (!d || !t || !pathAllowed(url) || !PATH_RE.test(t.pathname)) return false;
+  const keys = readSlipKey();
+  const profile = profileName();
+  const s = readOne(d, claim.slip_id, keys, profile);
+  return !!s && s !== "damaged" && s.action === action && s.site === t.origin && pathCovers(s.path, t.pathname)
+    && Date.parse(s.expires_at) > Date.now() && claim.use >= 1 && claim.use <= s.uses
+    && useVerifies(d, s.id, claim.use, keys, profile);
 }

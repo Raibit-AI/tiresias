@@ -2,7 +2,7 @@
 // W-11: history, the unofficial log. One compact line per call, like the
 // History tab in a browser. It is also the raw data for finding what
 // Tiresias is missing (W-12, needs.ts).
-import { appendLine, listLogs, pageLog, parseSince, utcDay, type LogPage } from "./store.js";
+import { appendLine, listLogs, pageLog, parseSince, utcDay, type LogPage, type LogScan } from "./store.js";
 import { LANG_SET } from "./lang.js";
 
 export interface HistoryEntry {
@@ -21,7 +21,7 @@ export interface HistoryEntry {
   llms_txt?: true; // the site advertised an llms.txt
   // v0.3 W-06 and W-03 (optional, fixed codes only):
   ticket?: "created" | "refused_cap"; // a read stopped at a wall: was a handoff ticket kept, or refused at the cap
-  source?: "provided_by_person"; // a resume that parsed a page a person saved (no request was sent)
+  source?: "provided_by_person" | "provided_by_agent"; // a resume that parsed a page a person saved (no request was sent)
   cache?: "fresh" | "revalidated" | "refetched"; // how the shared cache took part
   flag?: "phishing_list" | "web_risk"; // v0.3 W-19: the call was flagged, or read past a list flag with allow_flagged
   slip?: string; // v0.4 W-05: the permission slip a use was claimed from (tool "slip"; the purpose is the use label)
@@ -37,10 +37,15 @@ export interface HistoryEntry {
   by?: "terminal" | "not_terminal"; // best effort: whether standard input was a terminal
   confirmed?: "phrase" | "never_ask" | "not_needed";
   // v0.9 W-33 (tool "server"): the MCP server stopped at its memory ceiling (ceiling.ts), with the ceiling in MB
-  event?: "memory_ceiling";
+  event?: "memory_ceiling" | KeyEvent;
   memory_mb?: number;
+  // v1.1 workstream 4 (tool "keys"): a key was rotated, with how many slips the slip-key rotation revoked
+  revoked?: number;
   cut?: true; // a field was too long (or not a known code) and was cut or left out
 }
+
+export type KeyEvent = "signing_key_rotated" | "signing_key_rotation_finished" | "slip_key_rotated";
+const KEY_EVENTS = new Set<string>(["signing_key_rotated", "signing_key_rotation_finished", "slip_key_rotated"]);
 
 // Bounds on what one record may hold, so a single line can never outgrow a history page.
 const MAX_AGENT = 200;
@@ -56,7 +61,7 @@ const FLAGS = new Set(["phishing_list", "web_risk"]);
 const SLIP_ID = /^[A-Za-z0-9_-]{24}$/;
 const FILE_KINDS = new Set(["program", "script", "shortcut", "addon", "archive", "office", "image", "media", "unknown"]);
 const SCANS = new Set(["bad", "clean", "unknown", "failed"]);
-const SETTINGS = new Set(["saving", "rendering", "translator", "scanner", "anchoring", "anchor_calendars", "safe_browsing", "ports", "spacing_seconds", "never_visit", "hand_off", "confirmations"]);
+const SETTINGS = new Set(["private_spacing", "hook_secrets", "saving", "rendering", "translator", "scanner", "anchoring", "anchor_calendars", "safe_browsing", "ports", "spacing_seconds", "never_visit", "hand_off", "confirmations"]);
 const CHANGES = new Set(["looser", "stricter", "never_ask", "ask_again"]);
 const BYS = new Set(["terminal", "not_terminal"]);
 const HOWS = new Set(["phrase", "never_ask", "not_needed"]);
@@ -76,7 +81,7 @@ export function bound(e: HistoryEntry): HistoryEntry {
       over = true;
     }
   }
-  const drop = (k: "reason" | "matched" | "best_door" | "llms_txt" | "ticket" | "source" | "cache" | "flag" | "slip" | "file_kind" | "scan" | "lang" | "rendered" | "saved" | "setting" | "site_key" | "change" | "by" | "confirmed" | "event" | "memory_mb") => {
+  const drop = (k: "reason" | "matched" | "best_door" | "llms_txt" | "ticket" | "source" | "cache" | "flag" | "slip" | "file_kind" | "scan" | "lang" | "rendered" | "saved" | "setting" | "site_key" | "change" | "by" | "confirmed" | "event" | "memory_mb" | "revoked") => {
     delete e[k];
     over = true;
   };
@@ -85,7 +90,7 @@ export function bound(e: HistoryEntry): HistoryEntry {
   if (e.best_door !== undefined && !(typeof e.best_door === "string" && DOORS.has(e.best_door))) drop("best_door");
   if (e.llms_txt !== undefined && e.llms_txt !== true) drop("llms_txt");
   if (e.ticket !== undefined && !(typeof e.ticket === "string" && TICKETS.has(e.ticket))) drop("ticket");
-  if (e.source !== undefined && e.source !== "provided_by_person") drop("source");
+  if (e.source !== undefined && e.source !== "provided_by_person" && e.source !== "provided_by_agent") drop("source");
   if (e.cache !== undefined && !(typeof e.cache === "string" && CACHE.has(e.cache))) drop("cache");
   if (e.flag !== undefined && !(typeof e.flag === "string" && FLAGS.has(e.flag))) drop("flag");
   if (e.slip !== undefined && !(typeof e.slip === "string" && SLIP_ID.test(e.slip))) drop("slip");
@@ -99,7 +104,8 @@ export function bound(e: HistoryEntry): HistoryEntry {
   if (e.change !== undefined && !(typeof e.change === "string" && CHANGES.has(e.change))) drop("change");
   if (e.by !== undefined && !(typeof e.by === "string" && BYS.has(e.by))) drop("by");
   if (e.confirmed !== undefined && !(typeof e.confirmed === "string" && HOWS.has(e.confirmed))) drop("confirmed");
-  if (e.event !== undefined && e.event !== "memory_ceiling") drop("event");
+  if (e.event !== undefined && !(e.event === "memory_ceiling" || (typeof e.event === "string" && KEY_EVENTS.has(e.event)))) drop("event");
+  if (e.revoked !== undefined && !(Number.isSafeInteger(e.revoked) && e.revoked >= 0 && e.revoked <= 100_000)) drop("revoked");
   if (e.memory_mb !== undefined && !(Number.isSafeInteger(e.memory_mb) && e.memory_mb >= 1 && e.memory_mb <= 65536)) drop("memory_mb");
   if (over) e.cut = true;
   return e;
@@ -111,7 +117,7 @@ export function record(e: HistoryEntry): void {
   appendLine(`history/${utcDay(Number.isNaN(t) ? Date.now() : t)}.jsonl`, out);
 }
 
-export async function query(f: { since?: string; site?: string; agent?: string; page?: number }): Promise<LogPage<HistoryEntry>> {
+export async function query(f: { since?: string; site?: string; agent?: string; page?: number }, scan: LogScan = {}): Promise<LogPage<HistoryEntry>> {
   const since = parseSince(f.since);
   const site = f.site?.toLowerCase().replace(/^www\./, "");
   return pageLog<HistoryEntry>(
@@ -133,5 +139,6 @@ export async function query(f: { since?: string; site?: string; agent?: string; 
       return true;
     },
     f.page ?? 1,
+    40_000, scan,
   );
 }
