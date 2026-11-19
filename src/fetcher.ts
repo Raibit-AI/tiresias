@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // The polite fetcher: safety (safety.ts) plus the site's rules (rules.ts).
 // Every request except robots.txt itself goes through politeFetch.
+import { callContext, type RobotsPass } from "./context.js";
 import { cooldownLeft, setCooldown } from "./cooldown.js";
 import { Refused, Walled } from "./errors.js";
 import { spacingMs } from "./hosts.js";
 import { Turns, cooldownRefusal } from "./queue.js";
 import { checkAllowed } from "./rules.js";
 import { assertSiteAllowed } from "./sites.js";
+import { canonOrigin } from "./sitekey.js";
 import { safeFetch, type RawResponse, type SafeFetchOptions } from "./safety.js";
 import { detectWall, type WallInfo } from "./walls.js";
 
@@ -34,7 +36,8 @@ export async function policyCheck(u: URL): Promise<Policy> {
   return { ok: true, crawlDelay: d.crawlDelay };
 }
 
-export async function politeFetch(url: string, opts: SafeFetchOptions = {}): Promise<RawResponse> {
+type PoliteFetchOptions = SafeFetchOptions & { robotsPass?: false }; // probes always keep full spacing
+export async function politeFetch(url: string, opts: PoliteFetchOptions = {}): Promise<RawResponse> {
   const turns = new Turns();
   try {
     return await politeFetchHeld(url, opts, turns);
@@ -43,7 +46,10 @@ export async function politeFetch(url: string, opts: SafeFetchOptions = {}): Pro
   }
 }
 
-async function politeFetchHeld(url: string, opts: SafeFetchOptions, turn: Turns): Promise<RawResponse> {
+async function politeFetchHeld(url: string, opts: PoliteFetchOptions, turn: Turns): Promise<RawResponse> {
+  const holder = callContext.getStore()?.robotsPasses;
+  const canClaim = opts.robotsPass !== false && !opts.submit && opts.method !== "POST";
+  let first = true;
   const res = await safeFetch(url, {
     ...opts,
     onHeaders: (hop) => {
@@ -62,13 +68,28 @@ async function politeFetchHeld(url: string, opts: SafeFetchOptions, turn: Turns)
     },
     beforeRequest: async (u, signal) => {
       turn.leaveOthers(u);
-      const p = await policyCheck(u);
+      const origin = canonOrigin(u.origin);
+      const eligible = first && canClaim && holder && !holder.attempted.has(origin);
+      first = false;
+      // Claim before awaiting policy, even with no pending pass: only the first eligible fetch to
+      // this origin may use one. The policy check itself may fetch robots on direct fetcher paths.
+      if (eligible) holder.attempted.add(origin);
+      let p: Policy;
+      let pass: RobotsPass | undefined;
+      try {
+        p = await policyCheck(u);
+      } finally {
+        if (eligible) {
+          pass = holder.pending.get(origin);
+          holder.pending.delete(origin); // consumed on admission or refusal, used or not
+        }
+      }
       if (!p.ok && "wall" in p) throw new Walled(p.wall, p.wallUrl);
       if (!p.ok) throw p.refused === COOLDOWN_TEXT ? cooldownRefusal(u.origin, u.href) : new Refused(p.refused, p.retryAfter, p.retrySeconds, u.href);
       const d = p;
       // v0.5.1: every request is queued and spaced, by at least the default spacing (1 s).
       // W-25 (v0.6): a site's own spacing raises it further, never lowers it (applied in the queue, queue.ts).
-      await turn.take(u, Math.max(d.crawlDelay, spacingMs() / 1000), signal);
+      await turn.take(u, Math.max(d.crawlDelay, spacingMs() / 1000), signal, { pass: p.crawlDelay === 0 ? pass : undefined });
     },
   });
   return res;

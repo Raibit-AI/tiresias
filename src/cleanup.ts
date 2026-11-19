@@ -148,7 +148,9 @@ async function gather(h: string): Promise<Item[]> {
 // W-05: slips/ is not counted either: permissions, at most 200 small slips per profile.
 // W-28: saved/ has its own cap (max_saved_mb), so the main cap never evicts a snapshot to make room for cache.
 // W-08: anchors/ holds only hashes and salts (no browsing data) and is what keeps old proofs provable: not counted.
-const NOT_COUNTED = new Set(["bookmarks", "slips", "saved", "anchors", PROFILES_FOLDER, ...SHARED]);
+// W-38: guard/ is the owner's meaning check library, built by tiresias guard setup and bounded there (a few
+// thousand vectors): not browsing data, never evicted by the cap or by clear, removed by tiresias guard off.
+const NOT_COUNTED = new Set(["bookmarks", "slips", "saved", "anchors", "guard", PROFILES_FOLDER, ...SHARED]);
 // v0.6 (Codex browse rounds 3, 5 and 6): walked as a stream, so a folder with a huge number of entries never
 // has to fit in memory at once, with a budget of MEASURE.max entries and MEASURE_DEPTH levels, so a tampered
 // store cannot stall the trim. A count that did not finish is a LOWER bound: the disk cap is still applied

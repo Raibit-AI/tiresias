@@ -1,0 +1,17 @@
+import path from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+const LLM = process.env.LAB_LLM_URL;
+const tok = async (s) => { const r = await fetch(`${LLM}/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "lab", messages: [{ role: "user", content: s }], max_tokens: 1 }) }); return (await r.json()).usage?.prompt_tokens; };
+const client = new Client({ name: "v12-lab", version: "0" });
+await client.connect(new StdioClientTransport({ command: process.execPath, args: ["dist/cli.js", "mcp"], stderr: "ignore" }));
+const tools = (await client.listTools()).tools;
+const bare = await tok("hi");
+const all = tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.inputSchema } }));
+console.log("tools", tools.length, "names", tools.map((t) => t.name).join(","));
+console.log("all tools json chars", JSON.stringify(all).length, "tokens", (await tok(JSON.stringify(all))) - bare);
+const read = all.find((t) => t.function.name === "read");
+console.log("read tool chars", JSON.stringify(read).length, "tokens", (await tok(JSON.stringify(read))) - bare);
+console.log("instructions tokens", (await tok(client.getInstructions())) - bare);
+const per = []; for (const t of all) per.push([t.function.name, (await tok(JSON.stringify(t))) - bare]); console.log(per.map((p) => p.join(":")).join(" "));
+await client.close();

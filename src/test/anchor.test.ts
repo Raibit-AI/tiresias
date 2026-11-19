@@ -61,6 +61,7 @@ const site = await serve((req, res) => {
 // A fake OpenTimestamps calendar: POST /digest answers a pending timestamp naming itself; GET /timestamp/<hex>
 // answers 404 until `mined`, then a path to a Bitcoin attestation at HEIGHT.
 const HEIGHT = 900_123;
+const CAVEAT = "A calendar's report is not checked against Bitcoin here. To check it, run tiresias receipts verify and follow its last step, or use the official ots verify.";
 interface Cal {
   url: string;
   digests: Buffer[];
@@ -229,9 +230,17 @@ test("W-08: prove a pending receipt, verify it offline; upgrade reaches Bitcoin;
   calA.mined = true;
   const u1 = await anchor.upgrade();
   assert.equal(u1.upgrade.completed, 1);
+  assert.equal(u1.upgrade.still_pending, 0, "a claimed batch is not also counted as pending");
+  assert.equal(u1.message, `1 batch(es) checked: 1 reported in a Bitcoin block by a calendar, 0 still pending. ${CAVEAT}`);
   const st = await anchor.status();
   assert.equal(st.batches[0].status, "complete");
   assert.deepEqual(st.batches[0].bitcoin, [HEIGHT]);
+  assert.equal(st.message, `Anchoring is on. 1 batch(es): 1 reported in a Bitcoin block by a calendar, 0 pending. 0 fingerprint(s) not yet anchored. ${CAVEAT}`);
+  const statusText = await cli(["anchor", "status", "--text"]);
+  assert.equal(statusText.code, 0, statusText.stderr);
+  assert.match(statusText.stdout, /reported in Bitcoin block 900123\n/);
+  assert.equal(statusText.stdout.split(CAVEAT).length - 1, 1);
+  assert.ok(anchor.proveText(await anchor.prove(receiptFp)).endsWith(`A calendar reports its batch in Bitcoin block(s) 900123. ${CAVEAT}`));
   // The CLI export: three files; the record file's SHA-256 is the fingerprint, and the .ots starts from it.
   const out = tmpOut();
   const p = await cli(["receipts", "prove", receiptFp, "--out", out]);
@@ -651,7 +660,7 @@ test("8.3: upgrades keep the previous proof when merged nodes or the reserved pa
         count += length + 1;
       }
       const tip = [...ots.nodes(near)].find((n) => n.atts.length)!;
-      tip.atts.push(ots.pendingAtt(cal.url));
+      tip.atts = [ots.pendingAtt(cal.url)]; // an unanswered tip must still enforce the export limit
       assert.equal([...ots.nodes(near)].length, 19_998);
       b.ots = ots.serialize(near).toString("base64");
       fs.writeFileSync(file, JSON.stringify(b));
@@ -963,6 +972,117 @@ test("8.15: byte cursors cross read chunks and the batch cap without skipping un
       assertExportable(await anchor.prove(saved.receiptFingerprint(records[0])));
       assertExportable(await anchor.prove(saved.receiptFingerprint(records.at(-1)!)));
       assert.equal((await anchor.status()).not_yet_anchored, 0);
+    } finally { await cal.close(); }
+  });
+});
+
+test("D.1: only unanswered calendar branches are retried, without rewriting unchanged proofs", async () => {
+  await isolatedAnchor(async (dir) => {
+    let firstUrl = "", secondUrl = "", secondAnswered = false;
+    const pendingBranch = (msg: Buffer, uri: string, label: number) => {
+      const s = ots.newStamp(msg);
+      ots.chain(s, [{ tag: ots.APPEND, arg: Buffer.from([label]) }, { tag: ots.SHA256 }]).atts.push(ots.pendingAtt(uri));
+      return ots.serialize(s);
+    };
+    const claimed = (msg: Buffer) => {
+      const s = ots.newStamp(msg);
+      // Answer below the pending node, rather than directly on it.
+      ots.chain(s, [{ tag: ots.SHA256 }]).atts.push(ots.bitcoinAtt(HEIGHT));
+      return ots.serialize(s);
+    };
+    const first = await answeringCalendar((msg, post) => post ? pendingBranch(msg, firstUrl, 1) : claimed(msg));
+    firstUrl = first.url;
+    const second = await answeringCalendar((msg, post) => post ? pendingBranch(msg, secondUrl, 2) : secondAnswered ? claimed(msg) : pendingBytes(msg, secondUrl));
+    secondUrl = second.url;
+    const gets = (cal: typeof first) => cal.hits.filter((h) => h.path.startsWith("/timestamp/")).length;
+    try {
+      config({ anchoring: "on", anchor_calendars: [firstUrl, secondUrl] }, dir);
+      receiptLog([{ quote: "two calendars, one unchecked claim" }], dir);
+      const created = await anchor.run();
+      assert.ok(created.message.includes("It is pending until a calendar reports it in a Bitcoin block (usually a few hours): run tiresias anchor upgrade (or tiresias anchor) later."));
+      assert.ok(!created.message.includes(CAVEAT), "no caveat before any calendar report");
+      assert.ok(!(await anchor.status()).message.includes(CAVEAT));
+      const file = path.join(dir, "anchors", created.profile_batch!.id + ".json");
+      const initial = await anchor.upgrade();
+      assert.equal(initial.upgrade.completed, 1);
+      assert.equal(initial.upgrade.still_pending, 0);
+      const unchanged = fs.readFileSync(file);
+      const b = JSON.parse(unchanged.toString()) as Batch;
+      assert.equal(b.status, "complete");
+      assert.deepEqual(b.bitcoin, [HEIGHT]);
+      assert.equal(gets(first), 1);
+      assert.equal(gets(second), 1);
+      const realNow = Date.now;
+      const born = Date.parse(b.created_at);
+      try {
+        Date.now = () => born + 1000;
+        const next = await anchor.upgrade({ upgradeRequests: 1 });
+        assert.equal(next.upgrade.completed, 1);
+        assert.equal(next.upgrade.still_pending, 0);
+        assert.equal(next.upgrade.scan_incomplete, false);
+        assert.equal(next.upgrade.requests_not_asked, 0);
+        assert.equal(gets(first), 1, "an answered calendar neither uses budget nor receives another request");
+        assert.equal(gets(second), 2);
+        assert.deepEqual(fs.readFileSync(file), unchanged, "a successful duplicate reply changes neither bytes nor upgraded_at");
+
+        Date.now = () => born + 14 * 86_400_000 - 1;
+        assert.equal((await anchor.upgrade()).upgrade.completed, 1);
+        assert.equal(gets(second), 3);
+        Date.now = () => born + 14 * 86_400_000;
+        assert.equal((await anchor.upgrade()).upgrade.batches, 0);
+        Date.now = () => born + 15 * 86_400_000;
+        assert.equal((await anchor.upgrade()).upgrade.batches, 0);
+        assert.equal(gets(second), 3, "no requests at or beyond the age bound");
+      } finally { Date.now = realNow; }
+
+      config({ anchoring: "on", anchor_calendars: [firstUrl] }, dir);
+      assert.equal((await anchor.upgrade()).upgrade.batches, 0, "an answered allowed branch cannot keep a claimed batch eligible");
+      assert.equal(gets(second), 3, "an unanswered unlisted calendar is never asked");
+      config({ anchoring: "on", anchor_calendars: [firstUrl, secondUrl] }, dir);
+      secondAnswered = true;
+      assert.equal((await anchor.upgrade()).upgrade.completed, 1);
+      assert.equal(gets(second), 4);
+      const completed = fs.readFileSync(file);
+      assert.equal((await anchor.upgrade()).upgrade.batches, 0, "a batch with all branches answered is skipped");
+      assert.equal(gets(first), 1);
+      assert.equal(gets(second), 4);
+      assert.deepEqual(fs.readFileSync(file), completed);
+    } finally {
+      await first.close();
+      await second.close();
+    }
+  });
+});
+
+test("D.1: upgrade cursors retain answered entries and count only requests that can be asked", async () => {
+  await isolatedAnchor(async (dir) => {
+    const cal = await answeringCalendar((msg) => pendingBytes(msg, cal.url));
+    try {
+      config({ anchoring: "on", anchor_calendars: [cal.url] }, dir);
+      const b = putBatch(dir, { quote: "answered, allowed and unlisted branches" }, (root) => {
+        const s = ots.newStamp(root);
+        for (let i = 1; i <= 4; i++) {
+          const node = ots.chain(s, [{ tag: ots.APPEND, arg: Buffer.from([i]) }]);
+          node.atts.push(ots.pendingAtt(i === 2 ? "https://unlisted.example" : cal.url));
+          if (i === 4) ots.chain(node, [{ tag: ots.SHA256 }]).atts.push(ots.bitcoinAtt(HEIGHT));
+        }
+        return ots.serialize(s);
+      });
+      const file = path.join(dir, "anchors", b.id + ".json");
+      const before = fs.readFileSync(file);
+      const entries = ots.attestations(ots.parse(Buffer.from(b.id, "hex"), Buffer.from(b.ots, "base64"))).filter((p) => p.att.kind === "pending");
+      assert.equal(entries.length, 4);
+      const partial = await anchor.upgrade({ upgradeRequests: 1 });
+      assert.equal(partial.upgrade.requests_not_asked, 1);
+      assert.equal(partial.upgrade.scan_incomplete, true);
+      const cursor = JSON.parse(fs.readFileSync(path.join(dir, "anchors", "continuation"), "utf8")).upgrade;
+      assert.equal(cursor.att, 3, "the cursor counts the answered and unlisted entries too");
+      const resumed = await anchor.upgrade({ upgradeRequests: 1 });
+      assert.equal(resumed.upgrade.requests_not_asked, 0);
+      assert.equal(resumed.upgrade.scan_incomplete, false);
+      const asked = cal.hits.map((h) => h.path.split("/").pop());
+      assert.deepEqual(asked, [entries[1].msg.toString("hex"), entries[3].msg.toString("hex")]);
+      assert.deepEqual(fs.readFileSync(file), before, "duplicate merges do not rewrite a batch");
     } finally { await cal.close(); }
   });
 });

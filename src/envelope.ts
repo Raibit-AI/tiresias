@@ -28,6 +28,16 @@ export type Opts = {
   render?: boolean; // W-10 (v0.7): read and check: ask for the page to be rendered (only when the owner allows it)
   translate?: string; // W-26 (v0.7): read only: ask the owner's translation hook for this language (translate.ts)
   save?: boolean; // W-28 (v0.8): read only: keep a signed snapshot (only when the owner allows saving)
+  // v1.2: read only: "log" leaves the receipts list out of the reply once every receipt is in the local log
+  // (pipeline.ts, leaveReceiptsInLog). Without it, and always in private mode, the reply carries them as before.
+  receipts?: "reply" | "log";
+  // W-34 (v1.2): local mode's reply budget, in bytes of the parts a local reply carries (local.ts). Set only by
+  // local mode; without it every page is sized as before.
+  budget?: number;
+  renderIfShell?: boolean; // local mode: the owner's "ask" allows this call to render an empty shell
+  localTextBytes?: (text: string) => number; // v1.2: guarded section text, including possible meaning warnings
+  localSectionBytes?: (content: Uc, label: boolean) => number; // local metadata and labels before pagination
+  beforeLocalRecord?: (e: Envelope, meta: CallMeta) => Promise<void>; // Internal local shaping, before the history line is written
 };
 // W-03: how this call used the shared cache, and who is asking (for cached_by and the repeat-read rule).
 export type Serve = { cache?: CacheUse; agent?: string; render?: import("./render.js").RenderTop; save?: import("./pipeline.js").SaveCtx }; // render: W-10 (v0.7); save: W-28 (v0.8)
@@ -51,6 +61,7 @@ export interface CallMeta {
   first?: boolean; // check: no earlier copy was kept to compare with
   rendered?: true; // W-10 (v0.7): the page was rendered in this call
   saved?: true; // W-28 (v0.8): a snapshot was saved in this call
+  written_by?: number[]; // W-39 (v1.2): a local read of a page with visitor text: who wrote each part shown (Envelope.written_by)
 }
 export type Uc = Record<string, unknown>;
 
@@ -124,6 +135,12 @@ export const receiptsEnvelope = (url: string, r: { items: unknown[]; page: numbe
 export const historyEnvelope = (r: { items: unknown[]; page: number; pages: number; total: number }) => listEnvelope("", { history: r.items }, r);
 
 export const STOPPED = "Stopped. Tiresias does not retry or work around walls.";
+
+// W-39 (v1.2): the two values of a local passage's written_by, the wording measured in the lab.
+export const BY_SITE = "the site";
+export const BY_VISITOR = "a visitor to the site, not the site itself";
+// What one label adds to a passage at most (the longer value, its key and a comma), for the reply budget.
+export const LABEL_BYTES = jsonBytes({ written_by: BY_VISITOR }) - 2 + 1;
 
 // W-02 fixed texts.
 export const NO_BASELINE = "There was nothing to compare against: no earlier copy of this page is kept (first visit, a cleared or expired cache, or private mode).";
@@ -269,7 +286,10 @@ export async function guarded(...args: Parameters<typeof guardedCall>): Promise<
   } catch (e) {
     configError = e;
   }
-  return callContext.run({ ...callContext.getStore(), config, configError, getActions: undefined }, () => guardedCall(...args));
+  // One holder per tool/CLI call, before withSignal/runPrivate make shallow copies. Background door
+  // jobs create their own context without a holder, and an in-flight robots waiter gets no pass.
+  return callContext.run({ ...callContext.getStore(), config, configError, getActions: undefined,
+    robotsPasses: { pending: new Map(), attempted: new Set() } }, () => guardedCall(...args));
 }
 
 async function guardedCall(
@@ -335,6 +355,7 @@ async function guardedCall(
       lang: out.language?.code, // W-26 (v0.7)
       rendered: meta.rendered, // W-10 (v0.7)
       saved: meta.saved, // W-28 (v0.8)
+      written_by: meta.written_by, // W-39 (v1.2)
     });
   } catch (e) {
     console.error(`Could not write history: ${(e as Error).message}`);

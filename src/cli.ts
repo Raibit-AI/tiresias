@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // N-09: the command-line door. Same engine, same store as the MCP server.
 import "./nodecheck.js"; // first: an older Node gets a plain message before anything else runs
-import { textView } from "./textview.js";
+import { escapeTerminal, textView } from "./textview.js";
 import { parseArgs } from "node:util";
 import { drainForExit, installShutdown } from "./background.js";
 import { loadChoice, loadLimits } from "./config.js";
@@ -14,10 +14,14 @@ import { BROWSE_HELP, BROWSE_TAKES, noteCliRead, runBrowseCommand } from "./brow
 import { VERSION, type Envelope } from "./types.js";
 import { notice, startupNotice } from "./confirm.js";
 import { listEnvelope, historyEnvelope, receiptsEnvelope } from "./envelope.js";
+import { localRead, parseLocalBudget } from "./local.js";
 
 // JSON output carries `profile` at the top level when it is not `default` (W-18), and `settings_notice` when a risky
 // setting changed in the last 24 hours or a loosening waits for confirmation (W-32, v0.9).
-const json = (x: unknown, space = 2) => JSON.stringify(stampNotice(stampProfile(x)), null, space);
+// Terminal display only. Applying the escape again is harmless: backslashes stay unchanged.
+const print = (text: string | undefined) => console.log(escapeTerminal(String(text)));
+const printError = (text: string | undefined) => console.error(escapeTerminal(String(text)));
+const json = (x: unknown, space = 2) => escapeTerminal(JSON.stringify(stampNotice(stampProfile(x)), null, space));
 let noticeLines: string[] | undefined | null = null; // null: not looked up yet (once per process, after the profile is chosen)
 let profileSelected = false;
 function currentNotice(): string[] | undefined {
@@ -49,6 +53,9 @@ const HELP = `Tiresias ${VERSION}: the honest browser for AI agents.
                                      request through Tiresias's rules), when the owner allows it
                 [--save]     keep a signed snapshot of the bytes this read received, when the owner
                                      allows saving (tiresias settings set saving ask --confirm "YES, TURN ON SAVING")
+                [--local [--local-budget 6000]]   print the reply a local model gets from tiresias mcp --local.
+                                     With --local, the only other options are --question, --section,
+                                     --page and --local-budget
   tiresias doors <url>
   tiresias check <url> [--page 2] [--fresh]   if it changed: what changed (added and removed blocks)
   tiresias resume <ticket> [--from-file <path>]   pick up a read that stopped at a wall: retry it, or read
@@ -102,6 +109,19 @@ const HELP = `Tiresias ${VERSION}: the honest browser for AI agents.
                                      translation (none is included); it gets the text on standard
                                      input and the source and target languages as its last two arguments
   tiresias translator show | translator off   the translator setting, or remove it
+  tiresias guard setup --url http://localhost:1234/v1 --model <embedding model id> [--prefix "..."]
+                [--false-alarms 1] [--ordinary <file.jsonl> | --ordinary-urls <file.txt>] [--timeout 4]
+                                     the meaning check for local model mode: your own embedding model
+                                     compares each passage with known planted instructions (none is
+                                     included). Setup reads about 100 ordinary pages through Tiresias to
+                                     calibrate, unless you give your own; an address outside your network
+                                     takes --confirm "YES, SEND PAGE TEXT OUTSIDE MY NETWORK"
+  tiresias guard import <file> [--name <collection>]   create a new collection of planted texts (.jsonl with
+                                     "text", or one text per line). Pick an unused --name; "starter"
+                                     is reserved. Without --name, a unique name comes from the file
+  tiresias guard show | guard check [--file <path> | <text>] | guard off
+                                     the setting and library sizes; score one text; remove the setting and
+                                     the library
   tiresias settings                  every owner setting: value, default, what it does, where it is stored
   tiresias settings set <name> [<site>] <value> | settings reset <name> [<site>]   [--confirm "..."]
                                      change one setting (site settings: spacing_seconds, ports, hand_off,
@@ -133,6 +153,10 @@ const HELP = `Tiresias ${VERSION}: the honest browser for AI agents.
                                      delete one profile's folder (--delete-key when it has a signing key)
 ${BROWSE_HELP}
   tiresias mcp                       start the MCP server (stdio)
+  tiresias mcp --local [--local-budget 6000]   the MCP server for small models that run on your own
+                                     computer: one read tool, short instructions and short replies, about
+                                     6,000 characters of page text (--local-budget: 1000 to 20000).
+                                     Tiresias does not search the web, so give your model a search tool too
 
 Add --profile <name> to any command (or set TIRESIAS_PROFILE) to use that profile; without it,
 the default profile (the store folder itself) is used. The MCP server serves one profile, fixed
@@ -171,7 +195,7 @@ export function exitFor(status: string): number {
 // --profile, --text and --help go with every command; --private with every command that reads the store.
 const COMMON = ["profile", "text", "help", "private"];
 const TAKES: Record<string, string[]> = {
-  read: ["question", "section", "page", "changes", "fresh", "allow-flagged", "translate", "render", "save"],
+  read: ["question", "section", "page", "changes", "fresh", "allow-flagged", "translate", "render", "save", "local", "local-budget"],
   saved: ["page", "all"], // v0.8 (W-28)
   doors: ["allow-flagged"],
   check: ["page", "fresh", "allow-flagged"],
@@ -188,12 +212,13 @@ const TAKES: Record<string, string[]> = {
   keys: ["force", "host", "days", "out", "overlap", "finish", "slips", "confirm"], // overlap, finish, slips, confirm: v1.1 keys rotate
   scanner: ["timeout", "send-file", "confirm"], // confirm: v0.9 (W-32)
   translator: ["timeout", "confirm"], // v0.7 (W-26)
+  guard: ["url", "model", "prefix", "false-alarms", "ordinary", "ordinary-urls", "timeout", "confirm", "name", "file"], // v1.2 (W-38)
   settings: ["confirm"], // v0.6 (W-29); confirm: v0.9 (W-32)
   safety: [],
   slip: ["action", "site", "path", "until", "for", "uses", "note", "all", "page"],
   form: ["form", "set", "unset", "preview", "allow-flagged"],
   profile: ["yes", "delete-key"],
-  mcp: [],
+  mcp: ["local", "local-budget"], // W-34 (v1.2)
   ...BROWSE_TAKES, // v0.6 W-24 tabs, W-27 files (browsecli.ts)
 };
 
@@ -215,12 +240,12 @@ function helpFor(cmd: string): string | null {
 // The stream depends only on the status (Codex round 97: a --text error went to standard output); the
 // form (plain text, or JSON) only on --text.
 function printReply(r: { status: string; message: string }, text: boolean | undefined, plain: string = r.message): void {
-  if (r.status === "error") console.error(text ? plain : json(r, 0));
-  else console.log(text ? plain : json(r));
+  if (r.status === "error") printError(text ? plain : json(r, 0));
+  else print(text ? plain : json(r));
 }
 function printEnvelope(e: Envelope, text: boolean | undefined): void {
-  if (e.status === "error") console.error(text ? summary(e) : json(e, 0));
-  else console.log(text ? summary(e) : json(e));
+  if (e.status === "error") printError(text ? summary(e) : json(e, 0));
+  else print(text ? summary(e) : json(e));
 }
 
 function summary(e: Envelope): string {
@@ -338,6 +363,8 @@ async function main(): Promise<number> {
       form: { type: "string" }, set: { type: "string", multiple: true }, unset: { type: "string", multiple: true }, preview: { type: "string" },
       action: { type: "string" }, path: { type: "string" }, until: { type: "string" }, for: { type: "string" }, uses: { type: "string" }, note: { type: "string" },
       timeout: { type: "string" }, "send-file": { type: "boolean" }, translate: { type: "string" }, render: { type: "boolean" }, save: { type: "boolean" }, confirm: { type: "string" },
+      local: { type: "boolean" }, "local-budget": { type: "string" },
+      model: { type: "string" }, prefix: { type: "string" }, "false-alarms": { type: "string" }, ordinary: { type: "string" }, "ordinary-urls": { type: "string" }, name: { type: "string" }, file: { type: "string" },
       force: { type: "boolean" }, overlap: { type: "string" }, finish: { type: "boolean" }, slips: { type: "boolean" }, host: { type: "string" }, days: { type: "string" }, out: { type: "string" }, "older-than": { type: "string" }, all: { type: "boolean" }, "dry-run": { type: "boolean" }, help: { type: "boolean", short: "h" }, version: { type: "boolean" },
     },
   });
@@ -376,17 +403,17 @@ async function main(): Promise<number> {
       const all = profiles.list();
       const left = profiles.leftovers().length; // interrupted removals (Codex round 46)
       const note = left ? `${left} interrupted profile removal(s) left files in profiles/.removing-*; the next "tiresias profile remove" finishes them.` : undefined;
-      console.log(values.text ? all.map((p) => `${p.name}${p.created_at ? `  made ${p.created_at}` : ""}  key: ${p.signing_key ? "yes" : "no"}  signature_agent: ${p.signature_agent ?? "none"}${p.problem ? `  PROBLEM: ${p.problem}` : ""}`).concat(note ? [note] : []).join("\n") : json({ profiles: all, ...(left ? { removing_leftovers: left, note } : {}) }));
+      print(values.text ? all.map((p) => `${p.name}${p.created_at ? `  made ${p.created_at}` : ""}  key: ${p.signing_key ? "yes" : "no"}  signature_agent: ${p.signature_agent ?? "none"}${p.problem ? `  PROBLEM: ${p.problem}` : ""}`).concat(note ? [note] : []).join("\n") : json({ profiles: all, ...(left ? { removing_leftovers: left, note } : {}) }));
       return 0;
     }
     if (sub === "create" && name !== undefined) {
       const r = profiles.create(name, sessionPriv);
-      console.log(values.text ? r.message : json(r));
+      print(values.text ? r.message : json(r));
       return 0;
     }
     if (sub === "remove" && name !== undefined) {
       const r = profiles.remove(name, { yes: values.yes, deleteKey: values["delete-key"], priv: sessionPriv });
-      console.log(values.text ? r.message : json(r));
+      print(values.text ? r.message : json(r));
       return 0;
     }
     throw new Error("Usage: tiresias profile create <name> | profile list | profile remove <name> --yes [--delete-key]");
@@ -394,6 +421,9 @@ async function main(): Promise<number> {
   // W-18: one process serves one profile, chosen here once (--profile, else TIRESIAS_PROFILE, else
   // default). A profile that does not exist stops the command before anything is read or created.
   assertProfile();
+  // W-34 (v1.2): local model mode. --local-budget goes with --local only.
+  if (values["local-budget"] !== undefined && !values.local) throw new Error("--local-budget goes with --local.");
+  const localBudget = values.local ? parseLocalBudget(values["local-budget"]) : undefined;
   if (cmd === "mcp") {
     // Integration Codex round 3 (v0.8): `mcp --private` is the documented TIRESIAS_PRIVATE=1, for the whole server
     // (before, the flag was accepted and ignored, so calls without their own `private` were recorded).
@@ -406,8 +436,8 @@ async function main(): Promise<number> {
     // v0.9.1 (Travis, 2026-10-31): once per server, at start, one line on standard error when a risky setting is
     // held back for confirmation (the agent may never pass the reply notice on).
     const held = startupNotice(profileName());
-    if (held) process.stderr.write(`${held}\n`);
-    await serveStdio();
+    if (held) process.stderr.write(escapeTerminal(`${held}\n`));
+    await serveStdio(localBudget === undefined ? {} : { local: { budget: localBudget } });
     return -1; // keep running
   }
   installShutdown(); // v0.6 (Codex round 6): a signal during ANY command runs the bounded cleanup (lifetime.ts)
@@ -424,17 +454,17 @@ async function main(): Promise<number> {
     if (values.to !== undefined) {
       if (sessionPriv) throw new Error("Private mode: nothing is written, so the log is not exported. Run it without --to to print it.");
       const r = await engine.exportDailyLog(values.to, values.day);
-      console.log(values.json ? json(r) : r.message + `\n${r.file}`);
+      print(values.json ? json(r) : r.message + `\n${r.file}`);
     } else {
       const r = await engine.dailyLog(values.day, page);
-      console.log(values.json ? json(listEnvelope("", { day: r.day, entries: r.entries, log: r.text }, { page: r.page, pages: r.pages, total: r.entries })) : textView(r.text + (r.pages > 1 ? `\nPage ${r.page} of ${r.pages}. Use --page N for more.` : "")));
+      print(values.json ? json(listEnvelope("", { day: r.day, entries: r.entries, log: r.text }, { page: r.page, pages: r.pages, total: r.entries })) : textView(r.text + (r.pages > 1 ? `\nPage ${r.page} of ${r.pages}. Use --page N for more.` : "")));
     }
     return 0;
   }
   if (cmd === "needs") {
     const { toMarkdown } = await import("./needs.js");
     const r = await engine.needsReport(values.since, page);
-    console.log(values.json ? json(r) : textView(toMarkdown(r)));
+    print(values.json ? json(r) : textView(toMarkdown(r)));
     return 0;
   }
   if (cmd === "bookmark") {
@@ -460,7 +490,7 @@ async function main(): Promise<number> {
       await confirmByTyping(site, `Grant a permission slip: ${String(values.action)} on ${site}${values.path ? String(values.path) : ""}.`);
       const v = slips.grant({ action: values.action, site: values.site, path: values.path, until: values.until, for: values.for, uses: values.uses, note: values.note }, sessionPriv);
       const msg = `Granted slip ${v.id}: ${v.action} on ${v.site}${v.path ?? ""}${v.path ? " (and below)" : ""}, ${v.uses} use${v.uses === 1 ? "" : "s"}, until ${v.expires_at}. Revoke it with: tiresias slip revoke ${v.id}`;
-      console.log(values.text ? msg : json({ status: "ok", message: msg, slip: v }));
+      print(values.text ? msg : json({ status: "ok", message: msg, slip: v }));
       return 0;
     }
     if (sub === "revoke" && (id !== undefined) !== !!values.all) {
@@ -469,13 +499,13 @@ async function main(): Promise<number> {
         await confirmByTyping("revoke all", "Revoke every permission slip of this profile.");
         const n = slips.revokeAll(sessionPriv);
         const msg = `Revoked ${n} slip${n === 1 ? "" : "s"}. None of them can be used again.`;
-        console.log(values.text ? msg : json({ status: "ok", message: msg, revoked: n }));
+        print(values.text ? msg : json({ status: "ok", message: msg, revoked: n }));
       } else {
         const what = slips.confirmTextFor(id!);
         await confirmByTyping(what, `Revoke slip ${id}.`);
         slips.revoke(id!, sessionPriv);
         const msg = "Revoked. That slip can never be used again.";
-        console.log(values.text ? msg : json({ status: "ok", message: msg, revoked: 1 }));
+        print(values.text ? msg : json({ status: "ok", message: msg, revoked: 1 }));
       }
       return 0;
     }
@@ -486,7 +516,7 @@ async function main(): Promise<number> {
       const lines = [r.message, `Active ${c.active}, expired ${c.expired}, used up ${c.used_up}, damaged ${c.damaged}.`];
       for (const s of r.slips) lines.push(`  ${s.id}  ${s.action} on ${s.site}${s.path ?? ""}  ${s.uses_left} of ${s.uses} uses left  until ${s.expires_at}${notes.has(s.id) ? `  note: ${JSON.stringify(notes.get(s.id))}` : ""}`);
       if (r.pages > 1) lines.push(`Page ${r.page} of ${r.pages}. Use --page N for more.`);
-      console.log(values.text ? lines.join("\n") : json(r));
+      print(values.text ? lines.join("\n") : json(r));
       return 0;
     }
     throw new Error("Usage: tiresias slip grant --action submit_form --site <origin> [--path /p] [--until <date> | --for 7d] [--uses N] [--note text] | slip list | slip revoke <id> | slip revoke --all");
@@ -527,7 +557,7 @@ async function main(): Promise<number> {
   }
   if (cmd === "watch") {
     const r = await engine.watch(ctx, page);
-    console.log(values.text ? watchText(r) : json(r));
+    print(values.text ? watchText(r) : json(r));
     return 0;
   }
   if (cmd === "scanner") {
@@ -541,22 +571,66 @@ async function main(): Promise<number> {
       if (!command.length) throw new Error("Usage: tiresias scanner set [--timeout 10] [--send-file] -- /full/path/to/program [args...]");
       const cfg = scanner.setScanner(command, { timeout: values.timeout, sendFile: values["send-file"], confirm: values.confirm }, sessionPriv);
       const msg = `Scanner set: ${cfg.command[0]}${cfg.command.length > 1 ? ` with ${cfg.command.length - 1} argument(s)` : ""}, up to ${cfg.timeout_seconds} s per file, ${cfg.send_file ? "and it is handed the file itself (a quarantine copy, deleted after)" : "fingerprint only (not the file)"}. It runs on every high-risk file warning.`;
-      console.log(values.text ? msg : json({ status: "ok", message: msg, scanner: cfg }));
+      print(values.text ? msg : json({ status: "ok", message: msg, scanner: cfg }));
       return 0;
     }
     if (arg === "show") {
       const cfg = loadScanner();
       const msg = cfg ? `Scanner: ${JSON.stringify(cfg.command)}, ${cfg.timeout_seconds} s, send_file ${cfg.send_file}.` : "No scanner is set. Tiresias includes none; set your own with: tiresias scanner set -- /full/path/to/program [args...]";
-      console.log(values.text ? msg : json({ status: "ok", message: msg, scanner: cfg }));
+      print(values.text ? msg : json({ status: "ok", message: msg, scanner: cfg }));
       return 0;
     }
     if (arg === "off") {
       const was = scanner.clearScanner(sessionPriv);
       const msg = was ? "Scanner removed. File warnings are no longer checked by it." : "No scanner was set.";
-      console.log(values.text ? msg : json({ status: "ok", message: msg }));
+      print(values.text ? msg : json({ status: "ok", message: msg }));
       return 0;
     }
     throw new Error("Usage: tiresias scanner set [--timeout 10] [--send-file] -- /full/path/to/program [args...] | scanner show | scanner off");
+  }
+  if (cmd === "guard") {
+    // W-38 (v1.2): the owner's meaning check. Only here, from the command line (or by editing config.json): nothing
+    // in either MCP server reads, sets, changes or triggers it. Replies name collections and counts, never a text.
+    const g = await import("./guard.js");
+    const print = (r: { message: string }) => console.log(values.text ? r.message : json(r));
+    if (arg === "setup") {
+      const r = await g.setup({ url: values.url, model: values.model, prefix: values.prefix, falseAlarms: values["false-alarms"], timeout: values.timeout, ordinary: values.ordinary, ordinaryUrls: values["ordinary-urls"], confirm: values.confirm }, sessionPriv);
+      print(r);
+      return 0;
+    }
+    if (arg === "import") {
+      const file = positionals[2];
+      if (!file || positionals.length > 3) throw new Error("Usage: tiresias guard import <file> [--name <collection>]");
+      print(await g.importFile(file, values.name, sessionPriv));
+      return 0;
+    }
+    if (arg === "show" && positionals.length === 2) {
+      print(g.show());
+      return 0;
+    }
+    if (arg === "check") {
+      const words = positionals.slice(2).join(" ");
+      if ((values.file !== undefined) === (words !== "")) throw new Error("Usage: tiresias guard check [--file <path> | <text>]");
+      let text = words;
+      if (values.file !== undefined) {
+        const fsm = await import("node:fs");
+        const fd = fsm.openSync(values.file, fsm.constants.O_RDONLY | (fsm.constants.O_NONBLOCK ?? 0));
+        try {
+          const st = fsm.fstatSync(fd);
+          if (!st.isFile() || st.size > 64 * 1024) throw new Error("guard check --file takes a plain file of at most 64 KB.");
+          text = fsm.readFileSync(fd, "utf8");
+        } finally {
+          fsm.closeSync(fd);
+        }
+      }
+      print(await g.check(text));
+      return 0;
+    }
+    if (arg === "off" && positionals.length === 2) {
+      print(g.off(sessionPriv));
+      return 0;
+    }
+    throw new Error("Usage: tiresias guard setup --url <url> --model <id> [...] | guard import <file> [--name <collection>] | guard show | guard check [--file <path> | <text>] | guard off");
   }
   if (cmd === "saved") {
     // W-28 (v0.8): saved snapshots. Owner's commands: nothing in the MCP server lists, verifies or deletes them.
@@ -566,12 +640,12 @@ async function main(): Promise<number> {
       const r = sv.list(page);
       const L = [r.message, ...r.saved.map((i) => `  ${i.id.slice(0, 16)}  ${i.saved_at ?? "(damaged)"}  ${i.fingerprint_only ? "fingerprint only" : `${i.bytes} bytes${i.rendered ? ", rendered" : ""}`}, ${i.receipts} receipts  <${r.untrusted_content.urls.find((u) => u.id === i.id)?.final_url ?? ""}>`)];
       if (r.pages > 1) L.push(`Page ${r.page} of ${r.pages}. Use --page N for more.`);
-      console.log(values.text ? textView(L.join("\n")) : json(r));
+      print(values.text ? textView(L.join("\n")) : json(r));
       return 0;
     }
     if (sub === "show" && id) {
       const r = sv.show(id);
-      console.log(values.text ? textView(`${r.message}\nFolder: ${r.folder}${r.untrusted_content ? `\n${JSON.stringify(r.untrusted_content.manifest, null, 2)}` : ""}`) : json(r));
+      print(values.text ? textView(`${r.message}\nFolder: ${r.folder}${r.untrusted_content ? `\n${JSON.stringify(r.untrusted_content.manifest, null, 2)}` : ""}`) : json(r));
       return 0;
     }
     if (sub === "verify" && (id || values.all)) {
@@ -587,7 +661,7 @@ async function main(): Promise<number> {
     if (sub === "delete" && (id || values.all)) {
       if (sessionPriv) throw new Error("Private mode: nothing in the store is changed, so no snapshot is deleted.");
       const r = sv.remove(values.all ? "all" : id!);
-      console.log(values.text ? r.message : json(r));
+      print(values.text ? r.message : json(r));
       return 0;
     }
     throw new Error("Usage: tiresias saved [list] [--page N] | saved show <id> | saved verify <id> | --all | saved delete <id> | --all");
@@ -604,14 +678,14 @@ async function main(): Promise<number> {
     }
     if (sub === "upgrade") {
       const r = await an.upgrade();
-      console.log(values.text ? r.message : json(r));
+      print(values.text ? r.message : json(r));
       return 0;
     }
     if (sub === "status") {
       const r = await an.status(page);
-      const L = [r.message, `Calendars: ${r.calendars.join(", ")}`, ...r.batches.map((b) => `  ${b.id.slice(0, 16)}  ${b.created_at}  ${b.leaves} leaves  ${b.status === "complete" ? `in Bitcoin block ${b.bitcoin.join(", ")}` : "pending"}`)];
+      const L = [r.message, `Calendars: ${r.calendars.join(", ")}`, ...r.batches.map((b) => `  ${b.id.slice(0, 16)}  ${b.created_at}  ${b.leaves} leaves  ${b.status === "complete" ? `reported in Bitcoin block ${b.bitcoin.join(", ")}` : "pending"}`)];
       if (r.pages > 1) L.push(`Page ${r.page} of ${r.pages}. Use --page N for more.`);
-      console.log(values.text ? L.join("\n") : json(r));
+      print(values.text ? L.join("\n") : json(r));
       return 0;
     }
     throw new Error("Usage: tiresias anchor | anchor status [--page N] | anchor upgrade");
@@ -626,8 +700,8 @@ async function main(): Promise<number> {
       const msg = an.proveText(bd);
       if (values.out !== undefined) {
         const files = an.writeBundle(bd, values.out, !!sessionPriv);
-        console.log(values.text ? `${msg}\nWritten:\n${files.map((f) => `  ${f}`).join("\n")}\nCheck it with: tiresias receipts verify ${files[0]}${bd.batch.status === "complete" ? `  (or the official tool: ots verify ${files[files.length - 1]})` : ""}` : json({ status: "ok", message: msg, files }));
-      } else console.log(values.text ? msg : json({ status: "ok", message: msg, notice: (await import("./types.js")).NOTICE, untrusted_content: { bundle: bd } }));
+        print(values.text ? `${msg}\nWritten:\n${files.map((f) => `  ${f}`).join("\n")}\nCheck it with: tiresias receipts verify ${files[0]}${bd.batch.status === "complete" ? `  (or the official tool: ots verify ${files[files.length - 1]})` : ""}` : json({ status: "ok", message: msg, files }));
+      } else print(values.text ? msg : json({ status: "ok", message: msg, notice: (await import("./types.js")).NOTICE, untrusted_content: { bundle: bd } }));
       return 0;
     }
     const r = an.verifyBundle(target);
@@ -647,19 +721,19 @@ async function main(): Promise<number> {
       if (!command.length) throw new Error("Usage: tiresias translator set [--timeout 20] -- /full/path/to/program [args...]");
       const cfg = tr.setTranslator(command, { timeout: values.timeout, confirm: values.confirm }, sessionPriv);
       const msg = `Translator set: ${cfg.command[0]}${cfg.command.length > 1 ? ` with ${cfg.command.length - 1} argument(s)` : ""}, up to ${cfg.timeout_seconds} s per read. It runs only when a read asks for a translation, with the text on standard input and the source and target languages as its last two arguments.`;
-      console.log(values.text ? msg : json({ status: "ok", message: msg, translator: cfg }));
+      print(values.text ? msg : json({ status: "ok", message: msg, translator: cfg }));
       return 0;
     }
     if (arg === "show") {
       const cfg = loadTranslator();
       const msg = cfg ? `Translator: ${JSON.stringify(cfg.command)}, ${cfg.timeout_seconds} s.` : "No translator is set. Tiresias includes none; set your own with: tiresias translator set -- /full/path/to/program [args...]";
-      console.log(values.text ? msg : json({ status: "ok", message: msg, translator: cfg }));
+      print(values.text ? msg : json({ status: "ok", message: msg, translator: cfg }));
       return 0;
     }
     if (arg === "off") {
       const was = tr.clearTranslator(sessionPriv);
       const msg = was ? "Translator removed. Reads no longer offer translations." : "No translator was set.";
-      console.log(values.text ? msg : json({ status: "ok", message: msg }));
+      print(values.text ? msg : json({ status: "ok", message: msg }));
       return 0;
     }
     throw new Error("Usage: tiresias translator set [--timeout 20] -- /full/path/to/program [args...] | translator show | translator off");
@@ -668,14 +742,14 @@ async function main(): Promise<number> {
     // W-29 (v0.6): the settings page, CLI only: nothing in the MCP server reads or changes a setting.
     const r = (await import("./settings.js")).command(positionals.slice(1), sessionPriv, { confirm: values.confirm });
     noticeLines = null; // look again: this command may have just changed what the notice says
-    if (r.code) console.error(values.text ? r.text : json(r.reply, 0));
-    else console.log(values.text ? r.text : json(r.reply));
+    if (r.code) printError(values.text ? r.text : json(r.reply, 0));
+    else print(values.text ? r.text : json(r.reply));
     return r.code;
   }
   if (cmd === "safety") {
     if (arg === "status") {
       const r = engine.safetyStatus();
-      console.log(values.text ? `${r.message}\nList: ${r.list.state}${r.list.entries !== undefined ? `, ${r.list.entries} domains, confirmed ${r.list.verified_at}` : ""}\nWeb Risk: ${r.web_risk.configured ? `set up (${r.web_risk.from})` : "not set up"}` : json(r));
+      print(values.text ? `${r.message}\nList: ${r.list.state}${r.list.entries !== undefined ? `, ${r.list.entries} domains, confirmed ${r.list.verified_at}` : ""}\nWeb Risk: ${r.web_risk.configured ? `set up (${r.web_risk.from})` : "not set up"}` : json(r));
       return 0;
     }
     if (arg === "update") {
@@ -692,7 +766,7 @@ async function main(): Promise<number> {
     if (sub === "init") {
       if (sessionPriv) throw new Error("Private mode: nothing is written, so no key is made.");
       const r = await keys.initKey(values.force);
-      console.log(json({ message: r.replaced ? "Replaced your signing key." : "Made your signing key.", private_key_file: r.file, keyid: r.keyid, public_jwk: r.public_jwk, directory: r.directory, next: 'Host "directory" at /.well-known/http-message-signatures-directory on your site, and set "signature_agent" in config.json. The private key was not printed.' }));
+      print(json({ message: r.replaced ? "Replaced your signing key." : "Made your signing key.", private_key_file: r.file, keyid: r.keyid, public_jwk: r.public_jwk, directory: r.directory, next: 'Host "directory" at /.well-known/http-message-signatures-directory on your site, and set "signature_agent" in config.json. The private key was not printed.' }));
     } else if (sub === "show" || sub === "directory") {
       const { info, previous } = await keys.publishedKeys(); // v1.1: the previous key too, while its overlap window is open
       if (sub === "directory") console.log(JSON.stringify(info.directory, null, 2)); // the exact JSON to host: nothing added
@@ -704,7 +778,7 @@ async function main(): Promise<number> {
           agent = `(config.json problem: ${(e as Error).message})`;
         }
         const rotation = previous ? { previous_keyid: previous.keyid, rotated_at: previous.rotated_at, previous_leaves_directory_at: previous.until, note: "New requests are signed with the new key only. The previous key stays in the directory until then; run `tiresias keys rotate --finish` to drop it now." } : undefined;
-        console.log(json({ public_jwk: info.public_jwk, keyid: info.keyid, directory: info.directory, ...(rotation ? { rotation } : {}), signature_agent: agent, signing: agent && !agent.startsWith("(") ? "on" : "off (set signature_agent in config.json)" }));
+        print(json({ public_jwk: info.public_jwk, keyid: info.keyid, directory: info.directory, ...(rotation ? { rotation } : {}), signature_agent: agent, signing: agent && !agent.startsWith("(") ? "on" : "off (set signature_agent in config.json)" }));
       }
     } else if (sub === "sign-directory") {
       if (sessionPriv && values.out !== undefined) throw new Error("Private mode: nothing is written, so no files are made. Run it without --out to print the response.");
@@ -734,8 +808,8 @@ async function main(): Promise<number> {
           fsm.writeFileSync(tmp, content, { flag: "wx", mode: 0o644 });
           fsm.renameSync(tmp, target);
         }
-        console.log(json({ host: r.host, serve_at: `https://${r.host}${r.path}`, files: Object.keys(files).map((n) => pathm.join(folder, n)), expires_at: r.expires_at, reminder }));
-      } else console.log(json({ host: r.host, serve_at: `https://${r.host}${r.path}`, created_at: r.created_at, expires_at: r.expires_at, body: JSON.parse(r.body), headers: r.headers, reminder }));
+        print(json({ host: r.host, serve_at: `https://${r.host}${r.path}`, files: Object.keys(files).map((n) => pathm.join(folder, n)), expires_at: r.expires_at, reminder }));
+      } else print(json({ host: r.host, serve_at: `https://${r.host}${r.path}`, created_at: r.created_at, expires_at: r.expires_at, body: JSON.parse(r.body), headers: r.headers, reminder }));
     } else if (sub === "rotate") {
       // v1.1 workstream 4: rotate the signing key (overlap window) or, with --slips, the slip key.
       if (sessionPriv) throw new Error("Private mode: nothing is written, so no key is rotated.");
@@ -749,7 +823,7 @@ async function main(): Promise<number> {
         await confirmByTyping("rotate slip key", "Rotate the slip key: every permission slip of this profile is revoked now and can never be used again. Saved pages stay checkable against the old key's public half.");
         const r = slips.rotateSlipKey(values.confirm, sessionPriv);
         const msg = `Rotated the slip key. Revoked ${r.revoked} slip${r.revoked === 1 ? "" : "s"}; grant new ones with tiresias slip grant. ${r.retired ? "Saved pages signed before now still verify (tiresias saved verify names the retired key)." : "The old key could not be read, so it was replaced without keeping its public half: saved pages it signed no longer verify."} Receipts do not use the slip key and are unchanged. The private key was not printed.`;
-        console.log(values.text ? msg : json({ status: "ok", message: msg, revoked: r.revoked, old_key_kept_for_saved_pages: r.retired }));
+        print(values.text ? msg : json({ status: "ok", message: msg, revoked: r.revoked, old_key_kept_for_saved_pages: r.retired }));
       } else if (values.finish) {
         if (values.overlap !== undefined || values.confirm !== undefined) throw new Error("keys rotate --finish takes no other option.");
         const r = await keys.finishRotation();
@@ -757,7 +831,7 @@ async function main(): Promise<number> {
         const msg = r.finished
           ? `Finished the rotation: the previous key${r.previous_keyid ? ` (${r.previous_keyid})` : ""} is out of the directory and its private half is deleted. Publish the directory again (tiresias keys directory or keys sign-directory).`
           : "No rotation is in its overlap window, so there was nothing to finish.";
-        console.log(values.text ? msg : json({ status: "ok", message: msg, finished: r.finished, ...(r.previous_keyid ? { previous_keyid: r.previous_keyid } : {}) }));
+        print(values.text ? msg : json({ status: "ok", message: msg, finished: r.finished, ...(r.previous_keyid ? { previous_keyid: r.previous_keyid } : {}) }));
       } else {
         if (values.confirm !== undefined) throw new Error("keys rotate takes --confirm only with --slips.");
         const r = await keys.rotateKey({ overlapDays: keys.parseOverlap(values.overlap) });
@@ -766,7 +840,7 @@ async function main(): Promise<number> {
           ? `Rotated your signing key. New requests are signed with the new key (${r.keyid}). The previous key (${r.previous_keyid}) stays in your directory until ${r.overlap_until}, then drops out by itself (tiresias keys rotate --finish drops it now).`
           : `Rotated your signing key with no overlap. New requests are signed with the new key (${r.keyid}); the previous key (${r.previous_keyid}) is deleted and out of the directory now.`;
         const next = 'Publish the new directory now: tiresias keys directory (or keys sign-directory for a static host) and upload it to /.well-known/http-message-signatures-directory. A server that signs your directory itself (such as a Cloudflare Worker holding a copy of the key) needs the new key too. The private key was not printed.';
-        console.log(values.text ? `${msg}\n${next}` : json({ status: "ok", message: msg, keyid: r.keyid, public_jwk: r.public_jwk, previous_keyid: r.previous_keyid, overlap_days: r.overlap_days, overlap_until: r.overlap_until, directory: r.directory, private_key_file: r.file, next }));
+        print(values.text ? `${msg}\n${next}` : json({ status: "ok", message: msg, keyid: r.keyid, public_jwk: r.public_jwk, previous_keyid: r.previous_keyid, overlap_days: r.overlap_days, overlap_until: r.overlap_until, directory: r.directory, private_key_file: r.file, next }));
       }
     } else throw new Error("Usage: tiresias keys init [--force] | keys show | keys directory | keys sign-directory | keys rotate [--overlap 7] | keys rotate --finish | keys rotate --slips --confirm \"YES, ROTATE THE SLIP KEY\"");
     return 0;
@@ -778,8 +852,20 @@ async function main(): Promise<number> {
     const olderThanMs = rel ? Number(rel[1]) * 86_400_000 : undefined;
     if (sessionPriv && !values["dry-run"]) throw new Error("Private mode: nothing in the store is changed, so nothing is cleared. Use --dry-run to see what clear would remove.");
     const r = await clearStore({ limits: loadLimits(), olderThanMs, all: values.all, dryRun: values["dry-run"] });
-    console.log(values.text ? r.summary : json(r));
+    print(values.text ? r.summary : json(r));
     return r.not_removed ? 1 : 0; // v0.6: something clear meant to remove is still there
+  }
+  if (cmd === "read" && localBudget !== undefined) {
+    // What a local model gets: the read local mode makes, printed as JSON. A local model can pass only these
+    // options, and its reads are not tabs.
+    const extra = (tokens ?? []).find((t) => t.kind === "option" && !["local", "local-budget", "question", "section", "page", "private", "profile"].includes(t.name));
+    if (extra) throw new Error(`--local takes only --question, --section, --page and --local-budget, not --${(extra as { name: string }).name}.`);
+    const section = values.section === undefined ? undefined : Number(values.section);
+    if (section !== undefined && (!Number.isInteger(section) || section < 1)) throw new Error("--section must be a whole number, 1 or more");
+    const r = await localRead(need(), { question: values.question, section, page }, ctx, localBudget);
+    if (r.status === "error") printError(json(r, 0));
+    else print(json(r));
+    return exitFor(r.status);
   }
   let out: unknown;
   if (cmd === "read") {
@@ -797,7 +883,7 @@ async function main(): Promise<number> {
   }
   const isEnv = typeof out === "object" && out !== null && "notice" in out;
   if (isEnv) printEnvelope(out as Envelope, values.text);
-  else console.log(json(out));
+  else print(json(out));
   return isEnv ? exitFor((out as Envelope).status) : 0;
 }
 
@@ -808,7 +894,7 @@ main().then(
     if (code < 0) return;
     // W-32 (v0.9): a --text reply ends with the settings notice (a JSON reply carries it as settings_notice).
     const n = process.argv.includes("--text") && loadChoice("text_views") !== "wrapped" ? currentNotice() : undefined;
-    if (n) (code === 0 ? console.log : console.error)(`\nSettings notice:\n${n.map((l) => `  ${l}`).join("\n")}`);
+    if (n) (code === 0 ? print : printError)(`\nSettings notice:\n${n.map((l) => `  ${l}`).join("\n")}`);
     await drainForExit();
     process.exit(code);
   },
@@ -829,7 +915,7 @@ main().then(
     const sub = process.argv[2] && /^[a-z]{1,20}$/.test(process.argv[2]) ? process.argv[2] : "<command>";
     const msg = opt !== undefined ? `Unknown option ${JSON.stringify(opt)}. Run tiresias ${sub} --help for the options it takes.` : (e as Error).message;
     const n = process.argv.includes("--text") ? currentNotice() : undefined;
-    console.error(process.argv.includes("--text") ? msg + (n ? `\n\nSettings notice:\n${n.map((l) => `  ${l}`).join("\n")}` : "") : json({ status: "error", message: msg }, 0));
+    printError(process.argv.includes("--text") ? msg + (n ? `\n\nSettings notice:\n${n.map((l) => `  ${l}`).join("\n")}` : "") : json({ status: "error", message: msg }, 0));
     await drainForExit();
     process.exit(1);
   },

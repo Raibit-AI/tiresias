@@ -105,7 +105,9 @@ test("W-30: a first read returns the page after robots.txt alone; the door check
   assert.equal(background.backgroundCount(), 1);
   await background.drainBackground();
   for (const p of PROBE_PATHS) assert.equal(s.count(p), 1, `probe ${p} was sent once, after the reply`);
-  for (let i = 1; i < times.length; i++) assert.ok(times[i].t - times[i - 1].t >= 950, `gap ${i} (${times[i].path}): ${times[i].t - times[i - 1].t} ms`);
+  // v1.2 (2026-11-19): robots.txt and the first page are one visit, so gap 1 may be short. Every later
+  // request, the first probe included, still waits a full spacing after the one before it.
+  for (let i = 2; i < times.length; i++) assert.ok(times[i].t - times[i - 1].t >= 950, `gap ${i} (${times[i].path}): ${times[i].t - times[i - 1].t} ms`);
   assert.equal(doorsCacheFiles().length, 1, "the door answers are cached");
   // The next read uses the cached doors: the root is read from llms.txt, with no probe and no doors_pending.
   const before = times.length;
@@ -200,7 +202,10 @@ test("W-30: two reads of one new site start one job; a read during the checks wa
   assert.equal(background.backgroundCount(), 1, "one job per site");
   await background.drainBackground();
   for (const p of PROBE_PATHS) assert.equal(s.count(p), 1, `${p} probed once, not once per read`);
-  for (let i = 1; i < times.length; i++) assert.ok(times[i].t - times[i - 1].t >= 950, `gap ${i}: ${times[i].t - times[i - 1].t} ms`);
+  // v1.2 (2026-11-19): robots.txt and the first page are one visit, so gap 1 may be short. Every later
+  // request, the first probe included, still waits a full spacing after the one before it.
+  assert.deepEqual(times.slice(0, 2).map((x) => x.path), ["/robots.txt", "/p"], "the short gap is only ever robots.txt then its page");
+  for (let i = 2; i < times.length; i++) assert.ok(times[i].t - times[i - 1].t >= 950, `gap ${i}: ${times[i].t - times[i - 1].t} ms`);
 });
 
 test("W-30: background checks honour Crawl-delay; cancelling them leaves no lease and caches nothing", async () => {

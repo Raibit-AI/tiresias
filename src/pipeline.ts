@@ -5,7 +5,7 @@
 import { noteGetActions } from "./getactions.js";
 import { hostKey } from "./sitekey.js";
 import { startDoorProbe } from "./background.js";
-import { loadDoorsMode } from "./config.js";
+import { loadChoice, loadDoorsMode } from "./config.js";
 import { cooldownSeconds } from "./cooldown.js";
 import { FLAG_TEXT, mimeOf, type FileFlag, type ReadAs } from "./files.js";
 import { cachedDoors, noStore, probeOrigin, summarize, type OriginDoors } from "./doors.js";
@@ -13,6 +13,7 @@ import { FetchError, TiresiasError } from "./errors.js";
 import { politeFetch } from "./fetcher.js";
 import { after304, fromResponse, isFresh } from "./freshness.js";
 import { shown, type Passage } from "./reader.js";
+import { fencedText } from "./preformatted.js";
 import { PageTooComplex, runUntrusted } from "./sandbox.js";
 import { OVERLAY_TEXT, RENDERED_TEXT, RENDER_TEXT, loadRenderMode, looksLikeShell, renderHtml, type RenderMode, type RenderTop } from "./render.js";
 import type { Change, DiffResult } from "./diff.js";
@@ -28,7 +29,7 @@ import { fitTranslation, translateReply } from "./translate.js";
 import { saveSnapshot, savePolicy, savedText, type SaveInput, type SavedReason, type SavedTop } from "./saved.js";
 export { stampLanguage } from "./lang.js";
 
-import { BUDGET, CallMeta, DIFF_OMITTED, DiffState, MAX_AGENT, NO_BASELINE, NO_STORE_DIFF, OLD_READER, OTHER_SOURCE, Opts, Serve, Tool, Uc, env, fitEnvelope, wallEnv } from "./envelope.js";
+import { BUDGET, CallMeta, DIFF_OMITTED, LABEL_BYTES, DiffState, MAX_AGENT, NO_BASELINE, NO_STORE_DIFF, OLD_READER, OTHER_SOURCE, Opts, Serve, Tool, Uc, env, fitEnvelope, wallEnv } from "./envelope.js";
 import { fileOptions, fileWarning } from "./filereply.js";
 import { CacheEntry, type RenderInspection } from "./pagecache.js";
 
@@ -169,7 +170,9 @@ export function paginate<T>(items: T[], size: (t: T) => number, page: number, bu
 
 export const len = jsonBytes; // every page budget counts UTF-8 bytes of the JSON sent
 
-export async function buildContent(entry: CacheEntry, opts: Opts): Promise<{ uc: Uc; receipts: Receipt[]; error?: string }> {
+// `written_by` (W-39, local mode only): who wrote each part shown, on a page where visitor text was found; `label`:
+// the owner's written_by setting is on, so the reply carries it.
+export async function buildContent(entry: CacheEntry, opts: Opts): Promise<{ uc: Uc; receipts: Receipt[]; error?: string; written_by?: number[]; section_visitor?: [number, number, number?][]; heading_visitor?: number; label?: boolean }> {
   const p = entry.parsed;
   // Receipt measurement repeats the final URL for every unit, on the main thread (as in tabs.ts).
   const receiptUnits = opts.section === undefined ? p.sections.length : (p.sections.find((s) => s.n === opts.section)?.blocks.length ?? 0);
@@ -182,16 +185,28 @@ export async function buildContent(entry: CacheEntry, opts: Opts): Promise<{ uc:
   const titleReceipt = p.title ? [rc(p.title, null)] : [];
   // A heading Tiresias generated (a PDF's "Page N") is a label, not text from the source, so it gets no receipt.
   const labelled = (n: number) => !!p.sections.find((x) => x.n === n)?.generated;
+  // W-34 (v1.2): local mode sets a smaller budget. A local reply carries no receipts, links or forms (local.ts), so
+  // its pages are measured by the text it does carry; the receipts are still made and recorded for what is shown.
+  const local = opts.budget !== undefined;
+  const textBudget = opts.budget ?? BUDGET.sectionText;
+  // W-39 (v1.2): local mode, on a page where the reader found visitor text. The setting is read only then, so a bad
+  // value fails only the reads it would change, by name. Each label counts against the budget.
+  const visitorPage = local && p.sections.some((s) => s.visitor || s.blocks.some((b) => b.visitor));
+  const label = visitorPage && loadChoice("written_by") === "on";
+  const labelCost = label ? LABEL_BYTES : 0;
 
   if (opts.question) {
     // Keep the best passages that fit the page budget, receipts included.
     const passages: Passage[] = [];
     let used = 0;
     const found = await runUntrusted<Passage[]>({ op: "search", parsed: p, question: opts.question, k: 5 }, p.searchable_chars + opts.question.length); // the question counts too (round 84)
-    for (const x of found) {
-      const cost = len(x) + len(rc(x.text, x.section)) + (labelled(x.section) ? 0 : len(rc(x.heading, x.section)));
-      if (passages.length && used + cost > BUDGET.sectionText) break;
+    const by: number[] = [];
+    for (const hit of found) {
+      const { visitor, ...x } = hit; // the reader's mark never goes out as is
+      const cost = local ? len(x) + labelCost : len(x) + len(rc(x.text, x.section)) + (labelled(x.section) ? 0 : len(rc(x.heading, x.section)));
+      if (passages.length && used + cost > textBudget) break;
       passages.push(x);
+      by.push(visitor ?? 0);
       used += cost;
     }
     // Every returned fact is covered: each passage, and each distinct heading shown with one.
@@ -204,18 +219,47 @@ export async function buildContent(entry: CacheEntry, opts: Opts): Promise<{ uc:
       }
       rs.push(rc(x.text, x.section));
     }
-    return { uc: { ...base, question: opts.question.slice(0, 500), passages }, receipts: rs };
+    return { uc: { ...base, question: opts.question.slice(0, 500), passages }, receipts: rs, ...(visitorPage && by.length ? { written_by: by, label } : {}) };
   }
   if (opts.section !== undefined) {
     const s = p.sections.find((x) => x.n === opts.section);
     if (!s) return { uc: {}, receipts: [], error: `No section ${opts.section}. This page has ${p.sections.length} section${p.sections.length === 1 ? "" : "s"}.` };
     // The page size counts what is really sent: the text AND its receipt (which repeats the URL).
-    const pg = paginate(s.blocks, (b) => len(shown(b)) + len(rc(b.text, s.n)) + 4, page, BUDGET.sectionText);
-    const rs = pg.slice.map((b) => rc(b.text, s.n));
+    // v1.2: local boundaries include the actual reply's metadata, labels and guarded representation.
+    // Reserve cache metadata on every page so fresh and cached reads keep the same boundaries.
+    // v1.2: a preformatted block can hold many paragraphs. Page those independently so fitting one
+    // oversized block never discards its later paragraphs. Receipts keep the original source block.
+    const units = s.blocks.flatMap(source => {
+      const text = shown(source);
+      if (!local || !opts.localTextBytes) return [{ text, source }];
+      // v1.2: every preformatted paragraph keeps its own balanced original fence. The guard and
+      // pagination measure those delimiters too; receipts still quote the complete source block.
+      const pre = fencedText(text);
+      const parts = pre ? pre.body.split(/\n(?:[ \t]*\n)+/).map(part => part.replace(/^\n+|\n+$/g, "")).filter(part => part.length > 0)
+        .map((part, i) => `${i ? pre.close : pre.open}\n${part}\n${pre.close}`) : text.split("\n\n");
+      return parts.map(text => ({ text, source }));
+    });
+    const overhead = local && opts.localSectionBytes ? opts.localSectionBytes({ ...base, cached_at: entry.fetched_at,
+      section: { n: s.n, heading: s.heading, text: "", page: units.length, pages: units.length } }, label) : labelCost;
+    const pg = paginate(units, (b) => local && opts.localTextBytes ? opts.localTextBytes(b.text) + 4
+      : len(b.text) + (local ? 0 : len(rc(b.source.text, s.n))) + 4, page, textBudget - overhead);
+    const rs = [...new Set(pg.slice.map(b => b.source))].map(b => rc(b.text, s.n));
     rs.unshift(...(page === 1 ? titleReceipt : []), ...(s.generated ? [] : [rc(s.heading, s.n)])); // the heading is returned on every page (a generated label is not a quote)
+    const texts = pg.slice.map(b => b.text);
+    const spans: [number, number, number?][] = [];
+    if (visitorPage) {
+      let start = 0;
+      pg.slice.forEach((b, i) => {
+        if (b.source.visitor) spans.push([start, start + texts[i].length, b.source.visitor]);
+        start += texts[i].length + 2; // the blank line between blocks
+      });
+    }
     return {
-      uc: { ...(page === 1 ? base : { final_url: entry.final_url }), section: { n: s.n, heading: s.heading, text: pg.slice.map(shown).join("\n\n"), page, pages: pg.pages } },
+      uc: { ...(page === 1 ? base : { final_url: entry.final_url }), section: { n: s.n, heading: s.heading, text: texts.join("\n\n"), page, pages: pg.pages } },
       receipts: rs,
+      ...(visitorPage ? { section_visitor: spans, heading_visitor: s.visitor ?? 0 } : {}),
+      // A page of a section is one part: the visitor's when any paragraph on it is (it errs toward the visitor).
+      ...(visitorPage ? { written_by: [pg.slice.reduce((n, b) => (b.source.visitor && (!n || b.source.visitor < n) ? b.source.visitor : n), s.visitor ?? 0)], label } : {}),
     };
   }
   // Outline: each entry returns a heading and a preview, so each gets a receipt.
@@ -224,7 +268,11 @@ export async function buildContent(entry: CacheEntry, opts: Opts): Promise<{ uc:
     const receipts = [...(s.generated ? [] : [rc(s.heading, s.n)]), ...(preview ? [rc(preview, s.n)] : [])];
     return { item: { section: s.n, level: s.level, heading: s.heading, preview }, receipts };
   });
-  const out = paginate(units, len, page, BUDGET.outline);
+  // Local mode shows each entry as its number and heading only, against a budget in the same proportion as the
+  // default ones (outline to section text).
+  const out = local
+    ? paginate(units, (u) => len({ section: u.item.section, heading: u.item.heading }), page, Math.round((textBudget * BUDGET.outline) / BUDGET.sectionText))
+    : paginate(units, len, page, BUDGET.outline);
   const links = paginate(p.links, len, page, BUDGET.links);
   // W-04: forms, as fields, paged like links. Like links they carry no receipts (structure, not quotes).
   const forms = p.forms ? paginate(p.forms, len, page, BUDGET.forms) : null;
@@ -237,7 +285,7 @@ export async function buildContent(entry: CacheEntry, opts: Opts): Promise<{ uc:
       links: links.slice,
       ...(forms ? { forms: forms.slice, ...(page === 1 && p.forms_omitted ? { forms_omitted: p.forms_omitted } : {}), ...(forms.slice.length ? { forms_hint: FORMS_HINT } : {}) } : {}),
       page,
-      pages: Math.max(out.pages, links.pages, forms?.pages ?? 1),
+      pages: local ? out.pages : Math.max(out.pages, links.pages, forms?.pages ?? 1), // local replies list no links or forms
       section_count: p.sections.length,
       links_omitted: p.links_omitted,
       structured: p.structured_count || p.structured_skipped
@@ -248,6 +296,9 @@ export async function buildContent(entry: CacheEntry, opts: Opts): Promise<{ uc:
     receipts: rs,
   };
 }
+
+// The fixed note on a read of an empty JavaScript shell that was not rendered (local mode looks for it: local.ts).
+export const SHELL_NOTE = "This page looks like a JavaScript-only shell. Ask for rendering to read its content.";
 
 export const FORMS_HINT =
   "Forms are listed as fields (hidden ones by name only). To see exactly what a form would send, call form_preview with this url, the form's index and your values. Sending needs a permission slip, which only the owner grants from the command line; a form with not_allowed is never sent.";
@@ -284,19 +335,22 @@ export async function run(tool: Tool, rawUrl: string, opts: Opts, meta: CallMeta
   // reveals an earlier visit and never records this one.
   const priv = isPrivate();
   const cache = priv ? null : readJson<CacheEntry>(cacheFile);
+  // v1.2: old shell flags also obey the content test before a cached note or automatic render.
+  if (cache?.shell && !looksLikeShell(cache.parsed, true)) delete cache.shell;
   // An entry parsed by an older reader keeps its provenance (where it was read
   // from, its baseline) but its parsed form is rebuilt from the next response.
   // Older rendered entries lack the inspection codes and predate the textarea inspection. Rebuild them.
-  const staleParse = !!cache && (cache.parser !== PARSER_VERSION || (!!cache.rendered && !cache.render_inspection));
+  const staleParse = !!cache && (cache.parser !== PARSER_VERSION || (!!cache.rendered && !cache.render_inspection) || (opts.budget !== undefined && (!cache.visitor_scopes || !cache.visitor_main_scopes || !cache.visitor_heading_text)));
   // W-30: the owner's "doors" setting, read (and checked: a bad value fails the read, by name) on EVERY read,
   // whichever path it takes (Codex round 2).
   const doorsMode = tool === "read" ? loadDoorsMode() : "wait";
   // W-10 (v0.7): the owner's render setting (a bad value fails the read, by name). A read that asks for rendering
   // when it is allowed, and a check of a copy that was rendered, never reuse a plain copy as is.
   const renderMode: RenderMode = tool === "read" || tool === "check" ? loadRenderMode() : "off";
+  const autoShell = renderMode === "auto" || (renderMode === "ask" && opts.renderIfShell === true);
   // Explicit renders and checks of rendered copies need a body and a new browser run, even after a 304.
   // The one shortcut is an already rendered copy still fresh under the site's cache rules (below).
-  const rerender = renderMode !== "off" && (!!opts.render || (tool === "check" && !!cache?.rendered) || (renderMode === "auto" && !!cache?.shell && !cache.rendered));
+  const rerender = renderMode !== "off" && (!!opts.render || (tool === "check" && !!cache?.rendered) || (autoShell && !!cache?.shell && !cache.rendered));
   const needsBody = rerender || (renderMode === "off" && !!cache?.rendered);
   // W-28 (v0.8): a read that asks to save, when the owner allows it (a bad setting fails the read, by name). A save
   // keeps what THIS read received, so it never uses a fresh copy, a 304 or a cached rendering: it always fetches.
@@ -390,6 +444,7 @@ export async function run(tool: Tool, rawUrl: string, opts: Opts, meta: CallMeta
   // All parsing of the page runs under a hard time budget (sandbox.ts).
   let { parsed, wall: pageWall } = await parsePage(k, res.body, res.bytes, res.url, res.fileFlags, looksHtml(ct, res.body), res.headers.get("content-language"));
   throwIfCancelled();
+  const hasScript = k === "html" && /<script\b/i.test(res.body);
 
   // W-10 (v0.7): rendering. Asked for by the read, or (owner's "auto") an empty JavaScript shell, or a check of a
   // copy that was rendered (so like is compared with like). The rendered HTML goes through the same reader and
@@ -401,7 +456,7 @@ export async function run(tool: Tool, rawUrl: string, opts: Opts, meta: CallMeta
   // the same outline; when the page's own body is unchanged, the rendered copy is reused without starting a browser
   // (an explicit render asks for a new rendering).
   const plainHash = sha256(Buffer.concat([Buffer.from(`${k}|${(res.fileFlags ?? []).join(",")}|`), res.bytes ?? Buffer.from(res.body, "utf8")]));
-  const wantRender = !!opts.render || (renderMode !== "off" && !!cache?.rendered) || (renderMode === "auto" && k === "html" && looksLikeShell(parsed.text_chars, res.body));
+  const wantRender = !!opts.render || (renderMode !== "off" && !!cache?.rendered) || (autoShell && looksLikeShell(parsed, hasScript));
   const reuse = tool !== "check" && !opts.fresh && !opts.render && !sv && !staleParse && !!cache?.rendered && !!cache.render_hash && cache.plain_hash === plainHash && cache.source_url === source && cache.final_url === res.url;
   // v0.7 track 2: a CAPTCHA or login wall found in the plain HTML's markers waits for the render's verdict when a render
   // will decide this read (the browser sees whether the box is shown). A bot check (it is passed by running its script,
@@ -461,11 +516,11 @@ export async function run(tool: Tool, rawUrl: string, opts: Opts, meta: CallMeta
     const { fresh_until: _f, reuse_blocked: _b, ...rest } = cache!; // a full 200 judges freshness from scratch
     // Same bytes: the copy is kept, but how the site now describes it is taken fresh (round 83).
     // A saving read uses the fresh parse; otherwise only the current language hint needs refreshing.
-    entry = { ...rest, ...fresh, parsed: sv ? parsed : { ...rest.parsed, language: parsed.language }, ...(renderedHash && render ? { render_inspection: inspectionCodes(render) } : {}), content_type: ct, shell: k === "html" && looksLikeShell(parsed.text_chars, res.body) ? true : undefined, door_detail: doorDetail, redirected: res.redirected, etag: res.headers.get("etag") ?? cache!.etag, last_modified: res.headers.get("last-modified") ?? cache!.last_modified, checked_at: now };
+    entry = { ...rest, ...fresh, parsed: sv ? parsed : { ...rest.parsed, language: parsed.language }, ...(renderedHash && render ? { render_inspection: inspectionCodes(render) } : {}), content_type: ct, shell: looksLikeShell(parsed, hasScript) ? true : undefined, door_detail: doorDetail, redirected: res.redirected, etag: res.headers.get("etag") ?? cache!.etag, last_modified: res.headers.get("last-modified") ?? cache!.last_modified, checked_at: now };
   } else
     entry = {
-      parser: PARSER_VERSION, url, source_url: source, final_url: res.url, door, door_detail: doorDetail, hash, content_type: ct, parsed,
-      ...(k === "html" && looksLikeShell(parsed.text_chars, res.body) ? { shell: true as const } : {}),
+      parser: PARSER_VERSION, visitor_scopes: true, visitor_main_scopes: true, visitor_heading_text: true, url, source_url: source, final_url: res.url, door, door_detail: doorDetail, hash, content_type: ct, parsed,
+      ...(looksLikeShell(parsed, hasScript) ? { shell: true as const } : {}),
       etag: res.headers.get("etag") ?? undefined,
       last_modified: res.headers.get("last-modified") ?? undefined,
       // an identical body keeps its original read time, and with it the agent that first fetched it
@@ -547,10 +602,7 @@ export async function finishPage(
     stampLanguage(e, entry.parsed.language); // W-26 (v0.7)
     renderNote(e, serve.render ?? (entry.rendered ? cachedRender(entry) : undefined), meta);
     if (serve.cache) e.cache = serve.cache;
-    if (tool === "read" && entry.shell && !entry.rendered && !opts.render) {
-      const note = "This page looks like a JavaScript-only shell. Ask for rendering to read its content.";
-      e.message = e.message ? `${e.message} ${note}` : note;
-    }
+    if (tool === "read" && entry.shell && !entry.rendered && !opts.render) e.message = e.message ? `${e.message} ${SHELL_NOTE}` : SHELL_NOTE;
     if (fromCache) e.untrusted_content = { ...(e.untrusted_content ?? {}), ...cacheUc };
     if (sv) {
       // Reserve every field a successful save will add BEFORE sizing or translation. The real
@@ -620,6 +672,7 @@ export async function finishPage(
   }
   const c = await buildContent(entry, opts);
   if (opts.question !== undefined && Array.isArray(c.uc.passages)) meta.matched = c.uc.passages.length;
+  if (c.written_by) meta.written_by = c.written_by; // W-39: the levels go to the history, for the owner
   if (c.error) {
     persist(); // the page itself was read fine; only the section asked for is missing
     if (sv) sv.top = { status: "not_saved", reason: "no_page" };
@@ -636,6 +689,9 @@ export async function finishPage(
     receipts: rs,
   });
   if (entry.parsed.forms && reply.counts) reply.counts.forms = entry.parsed.forms.length + (entry.parsed.forms_omitted ?? 0); // W-04
+  if (c.written_by && c.label) reply.written_by = c.written_by; // W-39: local.ts makes the labels from it
+  if (c.section_visitor) reply.section_visitor = c.section_visitor;
+  if (c.heading_visitor !== undefined) reply.heading_visitor = c.heading_visitor;
   const out = withCache(reply);
   // W-26 (v0.7): the owner's translation hook, only when asked and only on a read. The receipts above were
   // built from the original text; the translation never becomes one.
@@ -648,8 +704,24 @@ export async function finishPage(
   if (sv?.input) for (const r of kept) delete r.snapshot;
   persist();
   saveNow(kept);
-  if (!priv) recordReceipts(kept);
+  const recorded = !priv && recordReceipts(kept);
+  if (tool === "read" && opts.receipts === "log" && recorded) leaveReceiptsInLog(out);
   return savedOn(out);
+}
+
+// v1.2 (field list, 2026-11-14): a reply repeats every heading, preview and paragraph it shows as a receipt, which
+// about doubles what the reading model takes in. A caller may ask for the receipts to stay in the local log
+// (read's `receipts: "log"`). The receipts are made and recorded exactly as before, and counts.receipts still says
+// how many; only the list is left out of this reply, and the reply says so with a fixed top-level mark. It is left
+// out only when every receipt was written whole: in private mode, when the log could not be written, or when the
+// logged copy of any receipt was cut for length (Codex review, 2026-11-14), the log does not hold them, so the
+// reply carries them as usual. A reply with no content (the one-line "unchanged" answer) has none to leave out,
+// and a file reply (filereply.ts) carries its receipts as before.
+export function leaveReceiptsInLog(e: Envelope): void {
+  const uc = e.untrusted_content as Record<string, unknown> | null;
+  if (!uc || !Array.isArray(uc.receipts)) return;
+  delete uc.receipts;
+  e.receipts_in_log = true;
 }
 
 // W-28 (v0.8): what a read that asked to save carries through the pipeline: the bytes to save, or why not; and the result.
@@ -674,11 +746,14 @@ export function renderNote(e: Envelope, render: RenderTop | undefined, meta: Cal
   return e;
 }
 
-export function recordReceipts(rs: Receipt[]): void {
+// True when every receipt was written to the log WHOLE. The logged copy of a very long quote or URL is cut
+// (receipts.ts), so a cut record, like a failed write, means the log does not hold what the reply quoted.
+export function recordReceipts(rs: Receipt[]): boolean {
   try {
-    receipts.record(rs);
+    return receipts.record(rs) === 0;
   } catch (e) {
     console.error(`Could not write receipts: ${(e as Error).message}`); // a log failure never fails the browsing call
+    return false;
   }
 }
 

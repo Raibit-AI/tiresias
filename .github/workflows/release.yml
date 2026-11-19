@@ -43,6 +43,10 @@ jobs:
       - run: npm test
         env:
           CI: "true"
+      # The meaning check's library: a release ships only when the working list (data-next/) has been folded into
+      # the released one (data/). The package's own scripts are off (.npmrc), so this is a step and not a hook.
+      - name: The library's two lists must be the same
+        run: node scripts/library.mjs gate
       - name: Software bill of materials
         run: npm sbom --sbom-format cyclonedx --omit dev > tiresias-sbom.cdx.json
       # Attached BEFORE staging: a staged version can't be staged again, so a rerun after a failed upload

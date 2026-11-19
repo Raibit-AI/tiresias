@@ -7,6 +7,7 @@ dist/
 .DS_Store
 *.tgz
 coverage/
+scripts/v12-lab/memo.json
 
 # Codex review logs stay private (kept in the private repo).
 docs/reviews/

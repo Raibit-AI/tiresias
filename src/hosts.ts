@@ -15,7 +15,7 @@ import { releaseLock, takeLock } from "./ownedlock.js";
 import { currentReadOnly } from "./safety.js";
 import { NOFOLLOW, NONBLOCK, ensureRoot, isPrivate, ownFile, readRoot, sha256, checkSub, mkdirOne } from "./store.js";
 
-const sharesSpacing = (): boolean => (!isPrivate() && !currentReadOnly()) || loadChoice("private_spacing") === "shared";
+export const sharesSpacing = (): boolean => (!isPrivate() && !currentReadOnly()) || loadChoice("private_spacing") === "shared";
 
 export const HOSTS = "hosts";
 export const DEFAULT_SPACING_MS = 1_000;
@@ -34,42 +34,44 @@ const fileOf = (dir: string, origin: string) => path.join(dir, sha256(origin).sl
 // last reservation left, AND `spacing` after that reservation's own start (Codex round 69: a 1-second
 // reservation must not let a 30-second Crawl-delay request start a second later).
 // The spacing file, read safely (no links, no blocking, a regular file of ours, at most 256 bytes).
-function readSpacing(file: string): { last: number; next: number } {
+export interface SpacingStamp { last: number; next: number }
+function readSpacing(file: string, strict = false): SpacingStamp | undefined {
   let fd: number;
   try {
     fd = fs.openSync(file, fs.constants.O_RDONLY | NOFOLLOW | NONBLOCK);
   } catch {
-    return { last: 0, next: 0 };
+    return undefined;
   }
   try {
     ownFile(fd, file);
-    if (fs.fstatSync(fd).size > 256) return { last: 0, next: 0 };
+    if (fs.fstatSync(fd).size > 256) return undefined;
     const o = JSON.parse(fs.readFileSync(fd, "utf8"));
     const next = Number(o?.next);
     const last = Number(o?.last);
+    if (strict && (typeof o?.last !== "number" || typeof o?.next !== "number" || !Number.isFinite(last) || !Number.isFinite(next))) return undefined;
     return { last: Number.isFinite(last) ? last : 0, next: Number.isFinite(next) ? next : 0 };
   } catch {
-    return { last: 0, next: 0 };
+    return undefined;
   } finally {
     fs.closeSync(fd);
   }
 }
 function readNext(file: string, spacing: number): number {
-  const { last, next } = readSpacing(file);
+  const { last, next } = readSpacing(file) ?? { last: 0, next: 0 };
   return Math.max(next, last ? last + spacing : 0);
 }
 
 // Reserve the next slot for `origin` with `spacing` ms between starts and return when it begins (epoch
 // ms). `earliest` is this process's own earliest time. Store trouble never fails a request: the slot is
 // then this process's own. `whenReady` leaves a future slot unclaimed so a cancelled wait moves nothing.
-export function reserve(origin: string, spacing: number, earliest: number, whenReady = false): number {
+export function reserve(origin: string, spacing: number, earliest: number, whenReady = false, pass?: SpacingStamp): number {
   const now = Date.now();
   let dir: string | null;
   try {
     if (!sharesSpacing()) {
       const r = readRoot();
       dir = r && checkSub(path.join(r, HOSTS)) ? path.join(r, HOSTS) : null;
-      return Math.max(now, earliest, dir ? readNext(fileOf(dir, origin), spacing) : 0);
+      return Math.max(now, pass ? 0 : earliest, dir ? readNext(fileOf(dir, origin), spacing) : 0);
     }
     const root = ensureRoot();
     dir = path.join(root, HOSTS);
@@ -86,7 +88,10 @@ export function reserve(origin: string, spacing: number, earliest: number, whenR
   // one the file shows, one spacing later, to stay clear of whoever holds the lock.
   if (!held) return Math.max(now, earliest, readNext(file, spacing)) + spacing;
   try {
-    const slot = Math.max(now, earliest, readNext(file, spacing));
+    // The active lease is still held. Only an exact, safely read completion stamp can be waived.
+    const current = pass ? readSpacing(file, true) : undefined;
+    const waive = pass && current?.last === pass.last && current?.next === pass.next;
+    const slot = waive ? now : Math.max(now, earliest, readNext(file, spacing));
     if (whenReady && slot > now) return slot;
     const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
     try {
@@ -99,6 +104,7 @@ export function reserve(origin: string, spacing: number, earliest: number, whenR
       fs.renameSync(tmp, file);
     } catch {
       fs.rmSync(tmp, { force: true });
+      if (waive) return Math.max(now, earliest, readNext(file, spacing));
     }
     return slot;
   } finally {
@@ -197,7 +203,7 @@ export function extendNext(origin: string, until: number): void {
     const file = fileOf(dir, origin);
     if (!lock(file)) return;
     try {
-      const { last, next } = readSpacing(file);
+      const { last, next } = readSpacing(file) ?? { last: 0, next: 0 };
       if (until <= next) return;
       const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
       const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW, 0o600);
@@ -217,7 +223,7 @@ export function extendNext(origin: string, until: number): void {
 // v0.6 (Codex round 11, coordinator's decision): a held turn's completion is recorded WHOLE in the shared file:
 // last = the completion time, next = the later of the old next and completion + delay. Every reader, whatever
 // spacing it needs, then measures from the last completion. Shared by default for private calls and previews; under the lock.
-export function noteCompletion(origin: string, t: number, until: number): void {
+export function noteCompletion(origin: string, t: number, until: number): SpacingStamp | undefined {
   if (!sharesSpacing()) return;
   try {
     const r = readRoot();
@@ -226,15 +232,18 @@ export function noteCompletion(origin: string, t: number, until: number): void {
     const file = fileOf(dir, origin);
     if (!lock(file)) return;
     try {
-      const { last, next } = readSpacing(file);
+      const previous = readSpacing(file, true);
+      const { last, next } = previous ?? readSpacing(file) ?? { last: 0, next: 0 };
+      const stamp = { last: Math.max(last, t), next: Math.max(next, until) };
       const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
       const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW, 0o600);
       try {
-        fs.writeSync(fd, JSON.stringify({ v: 1, last: Math.max(last, t), next: Math.max(next, until) }));
+        fs.writeSync(fd, JSON.stringify({ v: 1, ...stamp }));
       } finally {
         fs.closeSync(fd);
       }
       fs.renameSync(tmp, file);
+      return previous ? stamp : undefined;
     } finally {
       fs.rmSync(file + ".lock", { force: true });
     }
@@ -249,7 +258,7 @@ const pause = (ms: number, signal: AbortSignal) =>
     const stop = () => (clearTimeout(t), reject(signal.reason));
     signal.addEventListener("abort", stop, { once: true });
   });
-export async function acquireActive(origin: string, signal: AbortSignal): Promise<() => void> {
+export async function acquireActive(origin: string, signal: AbortSignal, onHeld?: () => void): Promise<() => void> {
   let dir: string | null = null;
   try {
     if (sharesSpacing()) {
@@ -285,6 +294,7 @@ export async function acquireActive(origin: string, signal: AbortSignal): Promis
           if (leaseToken(f) === token) fs.rmSync(f, { force: true });
         };
         const forget = holdLease(f, remove);
+        onHeld?.();
         return () => {
           remove();
           forget();

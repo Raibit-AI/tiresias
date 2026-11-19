@@ -5,6 +5,7 @@
 // instructions". We do three things: keep page content inside
 // untrusted_content, leave hidden text OUT of the readable text, and report
 // what we found in `flags` so the agent and its human can see the attempt.
+import { AIMED } from "./aimed.js";
 import type { Flag } from "./types.js";
 import { EN, otherMatches } from "./shieldphrases.js";
 import { hiddenText } from "./inspect.js";
@@ -66,6 +67,12 @@ export class Shield {
     // v0.7 (W-26): the same kind of phrase in the other twelve languages, in every language whose script the
     // text contains (shieldphrases.ts).
     for (const o of otherMatches(norm)) this.add({ type: "ai_directed_instruction", snippet: snippet(o.text, o.index), detail: `${where}; phrase in ${o.lang}` });
+    // v1.2: local mode's wider check, on the same bounded normalized text. add() keeps the cap and
+    // drops duplicate snippets when a phrase and a pattern point to the same passage.
+    for (const [name, { re }] of Object.entries(AIMED)) {
+      const m = re.exec(norm);
+      if (m) this.add({ type: "ai_directed_instruction", snippet: snippet(norm, m.index), detail: `${where}; pattern ${name}` });
+    }
   }
 
   hidden(reason: string, text: string): void {

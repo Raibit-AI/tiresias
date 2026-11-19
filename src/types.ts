@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Shared shapes. The envelope matches SPEC section 6.1.
 
-export const VERSION = "1.1.1"
+export const VERSION = "1.2.0"
 // Bump when the reader changes what it extracts, so older cached pages are re-read.
-export const PARSER_VERSION = 17; // 17: v1.1.1 whitespace-only form actions resolve against the base. 16: v1.1.0 form recognition (cached form listings carry not_allowed). 15: v1.0.1 reader fixes. 14: v0.9.1 sweep ("(JSON)" heading generated, list indentation capped at 8 levels, markdown code kept as preformatted, nesting past 256 flattened). 13: v0.9 labels Tiresias makes ("(top of page)", "(structured data)") are marked generated, never quoted. 12: v0.7 language (W-26). 11: v0.6 calendar events (ics.ts). 10: v0.5.1 JSON as line blocks, W-22 reader. 9: W-20 file kinds (scripts, CSV, calendars and contacts read as plain text; SVG; file flags)
+export const PARSER_VERSION = 20; // 20: W-39 attribution survives structural scopes, JSON-LD, pre descendants and flattening. 19: v1.2 W-39 blocks a visitor wrote carry their level. 18: v1.2 the page root (<html>, <body>) is never boilerplate. 17: v1.1.1 whitespace-only form actions resolve against the base. 16: v1.1.0 form recognition (cached form listings carry not_allowed). 15: v1.0.1 reader fixes. 14: v0.9.1 sweep ("(JSON)" heading generated, list indentation capped at 8 levels, markdown code kept as preformatted, nesting past 256 flattened). 13: v0.9 labels Tiresias makes ("(top of page)", "(structured data)") are marked generated, never quoted. 12: v0.7 language (W-26). 11: v0.6 calendar events (ics.ts). 10: v0.5.1 JSON as line blocks, W-22 reader. 9: W-20 file kinds (scripts, CSV, calendars and contacts read as plain text; SVG; file flags)
 export const MAX_URL = 2048; // longer URLs are omitted (and counted), never shortened;
 // The render guard's scan of a page's form actions (forms.ts for the HTML, renderactions.ts for the live page).
 export const MAX_FORM_ACTIONS = 1000;
@@ -144,6 +144,15 @@ export interface Envelope {
   render?: import("./render.js").RenderTop; // W-10 (v0.7): rendering, when asked or done (fixed codes and counts)
   translation?: import("./translate.js").TranslationTop; // W-26 (v0.7): the owner's translation hook, when asked
   saved?: import("./saved.js").SavedTop; // W-28 (v0.8): a read that asked to save (fixed codes, Tiresias's own hash and counts)
+  // W-39 (v1.2), local mode only, never in a default reply: on a page where visitor text was found, who wrote each
+  // passage (a question read) or the page of a section (a section read), in order: 0 the site, else the level (1 to
+  // 3) of the markup that says a visitor did. local.ts turns it into each passage's written_by.
+  written_by?: number[];
+  // Local shaping only: visitor ranges in a section's source text, before guarding and the final budget fit.
+  // Never copied to a model reply; the full server never sets this.
+  section_visitor?: [number, number, number?][];
+  heading_visitor?: number; // Local shaping only: the section heading's own attribution
+  receipts_in_log?: true; // v1.2: the caller asked for this read's receipts to stay out of the reply; every one is in the local log (counts.receipts)
   untrusted_content: Record<string, unknown> | null;
 }
 
@@ -188,12 +197,16 @@ export interface FormTop {
 export interface Block {
   text: string;
   marks: [number, number][]; // [position in text, link number]
+  // W-39 (v1.2): a visitor to the site wrote this text, by the page's own markup. The level is how the page says so:
+  // 1 a formal standard (schema.org, the ARIA comment role), 2 a section the page names, 3 a heading. Absent: the site.
+  visitor?: 1 | 2 | 3;
 }
 
 export interface Section {
   n: number;
   level: number; // 0 for text before the first heading
   heading: string;
+  visitor?: Block["visitor"]; // W-39: the heading's own mark, kept even when its container has no paragraphs
   generated?: true; // the heading is a label Tiresias made (a PDF's "Page 3"), not text from the source: it never becomes a receipt
   blocks: Block[];
 }

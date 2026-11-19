@@ -13,7 +13,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { callContext } from "./context.js";
-import { SECURITY_CHOICES, parseChoice, type SecurityChoice, DEFAULT_CALENDARS, parseAnchoring, parseCalendars, parseSafeBrowsing, parseSaving, parseScanner, parseTranslator, readConfigObject, writeConfig } from "./config.js";
+import { SECURITY_CHOICES, parseChoice, type SecurityChoice, DEFAULT_CALENDARS, parseAnchoring, parseCalendars, parseGuard, parseSafeBrowsing, parseSaving, parseScanner, parseTranslator, readConfigObject, writeConfig } from "./config.js";
 import { parseRender } from "./render.js";
 import { ConfigError } from "./errors.js";
 import * as history from "./history.js";
@@ -76,6 +76,8 @@ interface Top {
   what: (next: unknown) => string; // plain words for the notice and the log
 }
 const renderRank = rank(["off", "ask", "auto"]);
+const publicGuard = (v: unknown) => !!v && typeof v === "object" && (v as { allow_public?: unknown }).allow_public === true;
+const guardUrl = (v: unknown) => (v && typeof v === "object" ? String((v as { url?: unknown }).url) : "");
 export const TOP: Top[] = [
   { key: "private_spacing", looser: (c, n) => c !== "none" && n === "none", phrase: () => "YES, TURN OFF PRIVATE SPACING", what: () => "private spacing across processes turned off" },
   { key: "hook_secrets", looser: (c, n) => c !== "inherit" && n === "inherit", phrase: () => "YES, SHARE TIRESIAS SECRETS WITH HOOKS", what: () => "Tiresias secrets shared with hooks" },
@@ -100,7 +102,11 @@ export const TOP: Top[] = [
     what: () => "anchor calendars were added",
   },
   { key: "safe_browsing", looser: (c, n) => c !== false && n === false, phrase: () => "YES, TURN OFF SAFE BROWSING", what: () => "Safe Browsing turned off" },
+  // W-38 (v1.2): the meaning check sends page text to the owner's embedding endpoint. Sending it to an address
+  // outside the owner's network (allow_public) is the loosening; a new address with it set needs the phrase again.
+  { key: "guard", looser: (c, n) => publicGuard(n) && !(publicGuard(c) && guardUrl(c) === guardUrl(n)), phrase: () => GUARD_PHRASE, what: () => "the meaning check was allowed to send page text outside your network" },
 ];
+export const GUARD_PHRASE = "YES, SEND PAGE TEXT OUTSIDE MY NETWORK";
 const TOP_BY = new Map(TOP.map((t) => [t.key, t]));
 export const RISKY_KEYS = TOP.map((t) => t.key);
 export const isRisky = (name: string) => TOP_BY.has(name) || (SITE_RISKY as readonly string[]).includes(name);
@@ -420,6 +426,7 @@ function validTop(key: string, v: unknown): boolean {
     else if (key === "anchoring") parseAnchoring(v);
     else if (key === "anchor_calendars") parseCalendars(v);
     else if (key === "safe_browsing") parseSafeBrowsing(v);
+    else if (key === "guard") parseGuard(v);
     return true;
   } catch {
     return false;
@@ -581,7 +588,7 @@ export class ConfirmError extends ConfigError {}
 // ---- the notice in replies ----
 
 // Fixed text only (setting names, validated site names, times, fixed words). Undefined when there is nothing to say.
-export function notice(now = Date.now()): string[] | undefined {
+export function notice(now = Date.now(), includeGuard = true): string[] | undefined {
   try {
     const lines: string[] = [];
     const { rec, state } = loadRecord();
@@ -592,11 +599,14 @@ export function notice(now = Date.now()): string[] | undefined {
     } catch {
       raw = null; // a bad config.json is reported by the calls that use it
     }
-    for (const w of clamp(raw, rec).waiting)
+    const effective = clamp(raw, rec);
+    // Guard notices belong only to local replies while the check is set, so off restores their former output.
+    const showGuard = includeGuard && !!effective.obj?.guard;
+    for (const w of effective.waiting.filter((w) => w.setting !== "guard" || showGuard))
       lines.push(`config.json loosens ${w.setting}${w.site ? ` for ${w.site}` : ""}, but that was not confirmed, so it is not in force. To confirm: ${w.command}`);
     for (const e of envNotices(rec, raw)) lines.push(e);
     const since = now - NOTICE_HOURS * 3_600_000;
-    const recent = rec.recent.filter((c) => c.change !== "stricter" && Date.parse(c.at) >= since).reverse();
+    const recent = rec.recent.filter((c) => (c.setting !== "guard" || showGuard) && c.change !== "stricter" && Date.parse(c.at) >= since).reverse();
     for (const c of recent) lines.push(`${c.at}: ${describe(c)}. See tiresias history.`);
     if (!lines.length) return undefined;
     return lines.length > MAX_NOTICE ? [...lines.slice(0, MAX_NOTICE), `And ${lines.length - MAX_NOTICE} more: run tiresias settings.`] : lines;

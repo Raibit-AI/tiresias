@@ -286,7 +286,10 @@ test("W-20: robots.txt, probes and other page-only fetches never download a file
     html(res, "<html><body><h1>Fine</h1><p>A page.</p></body></html>");
   });
   const r = await engine.read(s.url + "/", {}, ctx);
-  assert.equal(r.status, "ok", "a binary robots.txt reads as no rules, as before");
+  // D.3 (2026-11-19): a robots.txt over 512 KB is never applied in part, whatever it holds. Before, this 30 MB
+  // binary read as "no rules" from its first 512 KB.
+  assert.equal(r.status, "refused", "a robots.txt cut at 512 KB means the site says no");
+  assert.match(r.message ?? "", /robots\.txt is larger than 512 KB/);
   // Socket buffers hold a few MB; a fetch that hashed the file would have taken all 30 MB.
   assert.ok(served < 10_000_000, `stopped early (${served} bytes written before the socket closed)`);
 });

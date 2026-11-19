@@ -11,7 +11,7 @@
 import os from "node:os";
 import path from "node:path";
 import {
-  parseChoice, ConfigError, DEFAULT_ANCHORING, DEFAULT_CALENDARS, DEFAULT_DOORS, DEFAULT_LIMITS, DEFAULT_SAVING, parseAnchoring, parseCalendars, KNOWN_KEYS, parseAgentStyle, parseDoors, parseKeyFile, parseSafeBrowsing, parseSaving, parseScanner,
+  parseChoice, ConfigError, DEFAULT_ANCHORING, DEFAULT_CALENDARS, DEFAULT_DOORS, DEFAULT_LIMITS, DEFAULT_SAVING, parseAnchoring, parseCalendars, KNOWN_KEYS, parseAgentStyle, parseDoors, parseGuard, parseKeyFile, parseSafeBrowsing, parseSaving, parseScanner,
   parseSignatureAgent, parseTranslator, readConfigObject, writeConfig,
 } from "./config.js";
 import { defaultKeyFile } from "./safebrowsing.js";
@@ -66,6 +66,8 @@ export const DEFS: Def[] = [
   { name: "safe_browsing", default: true, description: "Check every URL against the Phishing.Database list (and Google Web Risk, with a key) before requesting it.", check: parseSafeBrowsing, fromText: onOff("safe_browsing") },
   { name: "web_risk_key_file", default: null, description: "The file holding WEB_RISK_API_KEY= (a full path). Default for the default profile: ~/.config/tiresias/secrets.env.", check: parseKeyFile, fromText: parseKeyFile },
   { name: "scanner", default: null, description: "Your own virus checker, run on every high-risk file warning (none is included).", check: parseScanner, howToSet: "Set it with: tiresias scanner set [--timeout 10] [--send-file] -- /full/path/to/program [args...]" },
+  { name: "guard", default: null, description: "The meaning check for local model mode (W-38): your own embedding model, reached at an OpenAI-compatible address, compares each passage with a library of known planted instructions (none is included and nothing is sent anywhere until you set it up).", check: (v: unknown) => parseGuard(v), howToSet: "Set it with: tiresias guard setup --url http://localhost:1234/v1 --model <embedding model id> (see tiresias guard --help); remove it with: tiresias guard off" },
+  { name: "written_by", default: "on", description: 'Local model mode\'s label for who wrote each passage (W-39): "on" gives every passage of a page that carries visitor text (comments, reviews, forum posts, as the page\'s own markup marks them) a written_by saying whether the site or a visitor wrote it; "off" leaves it out. It is a fact about the page, not a warning, and nothing is withheld because of it.', check: (v) => parseChoice("written_by", v), fromText: (v) => parseChoice("written_by", v) },
   { name: "translator", default: null, description: "Your own translation program, run only when an agent asks a read for a translation; it gets the page's text on standard input and the source and target languages as its last two arguments (none is included).", check: parseTranslator, howToSet: "Set it with: tiresias translator set [--timeout 20] -- /full/path/to/program [args...]" },
 ];
 const DEF = new Map(DEFS.map((d) => [d.name, d]));
@@ -116,6 +118,7 @@ const ENV: { name: string; default: string; description: string; secret?: true }
   { name: "TIRESIAS_RENDERING", default: "not set", description: 'off, ask or auto: overrides the "rendering" setting for the session.' },
   { name: "TIRESIAS_CHROME", default: "not set", description: "The full path of the Chrome program used to render pages, when it is not in the usual place. Tiresias never downloads a browser." },
   { name: "TIRESIAS_WEB_RISK_KEY", default: "not set", description: "A Google Web Risk key (shown here only as set or not set).", secret: true },
+  { name: "TIRESIAS_GUARD_KEY", default: "not set", description: "A key for the meaning check's embedding endpoint, sent as a Bearer token, read when a call is made and never stored (shown here only as set or not set).", secret: true },
 ];
 
 export interface SettingRow {
@@ -381,7 +384,7 @@ export function reset(name: string | undefined, rest: string[], priv: boolean, c
 // edit that loosened it). Nothing in config.json changes; the record does, and history says who confirmed it.
 export function confirmNow(name: string | undefined, rest: string[], priv: boolean, confirm?: string): ChangeResult {
   if (priv) throw new ConfigError(PRIVATE);
-  if (!name || !isRisky(name)) throw new ConfigError("Usage: tiresias settings confirm <risky setting> [<site>] --confirm \"...\". Risky settings: private_spacing, hook_secrets, saving, rendering, translator, scanner, anchoring, anchor_calendars, safe_browsing, and the site settings ports, spacing_seconds, never_visit, hand_off.");
+  if (!name || !isRisky(name)) throw new ConfigError("Usage: tiresias settings confirm <risky setting> [<site>] --confirm \"...\". Risky settings: private_spacing, hook_secrets, saving, rendering, translator, scanner, anchoring, anchor_calendars, safe_browsing, guard, and the site settings ports, spacing_seconds, never_visit, hand_off.");
   const site = SITE_DEF.has(name) ? siteArgs(name, rest, false).site : undefined;
   if (!site && rest.length) throw new ConfigError(`Usage: tiresias settings confirm ${name} --confirm "..."`);
   const file = configFile();

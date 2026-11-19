@@ -7,7 +7,7 @@ import { LruMap, MAX_HOSTS } from "./lru.js";
 import { Turns, noteDelay } from "./queue.js";
 import { READ_SLACK, WIRE_EXTRA, callCache, currentSignal, safeFetch } from "./safety.js";
 import { isPrivate } from "./store.js";
-import { callContext } from "./context.js";
+import { callContext, type RobotsPass } from "./context.js";
 import { scanBody } from "./sandbox.js";
 import { detectWall, type WallInfo } from "./walls.js";
 
@@ -263,6 +263,10 @@ async function fetchRobots(origin: string): Promise<Robots> {
   let reserved = budget ? ROBOTS_COST : 0;
   let charged = reserved; // a failure is charged in full (bytes may have arrived)
   const turns = new Turns(); // robots.txt holds its site's turn until read AND parsed, its delay noted (rounds 74, 86)
+  const holder = callContext.getStore()?.robotsPasses;
+  // Per FETCH, not per call: redirects and a 304 retry invalidate this fetch's pass; another site's
+  // fresh robots fetch in the same call can still pair. Only this fetching async context owns it.
+  const visit: { requests: number; pass?: RobotsPass } = { requests: 0 };
   try {
   try {
     const fetchRobots = () => safeFetch(origin + "/robots.txt", {
@@ -288,8 +292,10 @@ async function fetchRobots(origin: string): Promise<Robots> {
         if (u.origin !== origin && (u.pathname !== "/robots.txt" || u.search))
           throw new Refused("robots.txt redirected to another site's path, so Tiresias assumes the site says no.");
         if (cooldownLeft(u.origin) > 0) throw new Refused("The site asked Tiresias to wait (Retry-After). Not calling it again yet.", undefined, cooldownLeft(u.origin), u.href);
+        visit.requests++;
+        visit.pass = undefined;
         turns.leaveOthers(u);
-        await turns.take(u, spacingMs() / 1000, signal); // v0.5.1: robots.txt waits its turn too (v0.6: and a site's own spacing, in the queue)
+        await turns.take(u, spacingMs() / 1000, signal, { robots: visit }); // v0.5.1: robots.txt waits its turn too (v0.6: and a site's own spacing, in the queue)
       },
     });
     let res = await fetchRobots();
@@ -324,6 +330,8 @@ async function fetchRobots(origin: string): Promise<Robots> {
       robots = closed("robots.txt returned an unexpected HTTP 304, so Tiresias assumes the site says no.", 60_000);
     else if (res.status === 206)
       robots = closed("robots.txt came back partial (HTTP 206), so Tiresias assumes the site says no.", 60_000);
+    else if (res.status >= 200 && res.status < 300 && res.truncated)
+      robots = closed("robots.txt is larger than 512 KB, too large to apply faithfully, so Tiresias assumes the site says no.", ONE_HOUR);
     else if (res.status >= 200 && res.status < 300 && (res.bytes !== undefined || res.file !== undefined))
       // v0.9 hardening (Codex round 2b, HIGH): a robots.txt the fetcher took for a PDF or a file comes back with no
       // text, which would parse as "no rules". What Tiresias cannot read as text, it takes as "the site says no".
@@ -340,7 +348,9 @@ async function fetchRobots(origin: string): Promise<Robots> {
       // The cooldown itself was recorded when the headers arrived (onHeaders above).
       const ra = res.headers.get("retry-after") ?? undefined;
       const secs = res.status === 429 || res.status === 503 ? cooldownSeconds(res.status, ra ?? null) : undefined;
-      robots = closed(`robots.txt returned HTTP ${res.status}, so Tiresias assumes the site says no.`, 60_000, { retryAfter: ra, retrySeconds: secs });
+      // A 429 or 503 is the site asking for a wait, and the reply says so: "assumes the site says no" read as a
+      // refusal for good, and a caller gave up on a page it could have read a minute later (field list, 2026-11-14).
+      robots = closed(secs !== undefined ? `robots.txt returned HTTP ${res.status}: the site asked Tiresias to wait, so nothing on it is read yet. This is a wait, not a no. Ask again in ${secs} seconds.` : `robots.txt returned HTTP ${res.status}, so Tiresias assumes the site says no.`, 60_000, { retryAfter: ra, retrySeconds: secs });
     } else robots = { mode: "missing", rules: [], crawlDelay: 0, sitemaps: [], expires: Date.now() + ONE_HOUR };
   } catch (e) {
     // A challenged redirect on the way to robots.txt is a wall at that hop.
@@ -357,6 +367,7 @@ async function fetchRobots(origin: string): Promise<Robots> {
   }
   } finally {
     turns.giveBack();
+    if (visit.requests === 1 && visit.pass) holder?.pending.set(visit.pass.origin, visit.pass);
     if (budget && reserved) budget.release(reserved, charged);
   }
   // Cache-Control: no-store: keep it for this one call only, never across calls.

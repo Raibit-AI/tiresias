@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // N-06: the per-site queue. Every request (pages, discovery probes, robots.txt) waits its turn here and
 // is spaced from the one before it by the site's spacing (1 s by default, or a larger Crawl-delay).
+import type { RobotsPass } from "./context.js";
 import { cooldownLeft, onCooldown } from "./cooldown.js";
 import { FetchError, Refused } from "./errors.js";
-import { acquireActive, extendNext, noteCompletion, reserve } from "./hosts.js";
+import { acquireActive, extendNext, noteCompletion, reserve, sharesSpacing, spacingMs } from "./hosts.js";
 import { MAX_HOSTS } from "./lru.js";
 import { canonOrigin } from "./sitekey.js";
 import { noteApplied, siteSpacing } from "./sites.js";
@@ -78,7 +79,8 @@ export function sleep(ms: number, signal: AbortSignal): Promise<void> {
 // With `hold`, the turn is kept until the returned function is called (Codex round 73: one request at a
 // time means until its answer has been read, not only until it was sent); without it, the turn passes on
 // as soon as the request may start.
-export async function throttle(origin: string, delay: number, outer: AbortSignal, url: string, hold = false): Promise<() => void> {
+interface TurnOptions { robots?: { requests: number; pass?: RobotsPass }; pass?: RobotsPass }
+export async function throttle(origin: string, delay: number, outer: AbortSignal, url: string, hold = false, options: TurnOptions = {}): Promise<() => void> {
   origin = canonOrigin(origin); // v0.6: "example.com." and "example.com" share one queue and one clock
   let target: URL | null = null;
   try {
@@ -103,6 +105,8 @@ export async function throttle(origin: string, delay: number, outer: AbortSignal
   const tail = prev.then(() => turn);
   chains.set(origin, tail);
   let activeRelease: () => void = () => {};
+  let activeHeld = false;
+  const visit = options.robots;
   let admittedMs = 0; // the spacing this request was admitted with
   const done = () => {
     // v0.6 (Codex round 9): a held turn ends when the answer has been read. The site's clocks are moved on from
@@ -113,7 +117,8 @@ export async function throttle(origin: string, delay: number, outer: AbortSignal
       const d = Math.max(admittedMs, delayOf.get(origin) ?? 0); // a Crawl-delay learned meanwhile counts too
       lastHit.set(origin, t);
       nextOk.set(origin, Math.max(nextOk.get(origin) ?? 0, t + d)); // this process's clock (private calls too)
-      noteCompletion(origin, t, t + d); // other processes: last = completion, next = max(next, completion + delay)
+      const shared = noteCompletion(origin, t, t + d); // other processes too
+      if (visit?.requests === 1 && (!sharesSpacing() || activeHeld)) visit.pass = { origin, last: t, next: nextOk.get(origin)!, shared };
     }
     activeRelease();
     release();
@@ -128,7 +133,7 @@ export async function throttle(origin: string, delay: number, outer: AbortSignal
     await Promise.race([prev, cancelled]);
     // Holding the turn: first the cross-process lease (Codex round 76: waiting for it AFTER reserving a
     // slot let the slot go stale), then the shared slot and its spacing.
-    activeRelease = await Promise.race([acquireActive(origin, mine.signal), cancelled]);
+    activeRelease = await Promise.race([acquireActive(origin, mine.signal, () => { activeHeld = true; }), cancelled]);
     // W-25 (v0.6): a site's own spacing (sites.ts) raises the spacing. Like every spacing since v0.5.1 it is per
     // ORIGIN (scheme, host and port). Settings are the call's snapshot, read once when the call started
     // (coordinator's rule after Codex round 11): a change saved meanwhile applies to calls that start after it.
@@ -137,7 +142,16 @@ export async function throttle(origin: string, delay: number, outer: AbortSignal
     for (;;) {
       if (mine.signal.aborted) throw new Error("queue-cancelled");
       if (cooldownLeft(origin) > 0) throw cooldownRefusal(origin, url);
-      const slot = reserve(origin, eff * 1000, Math.max((lastHit.get(origin) ?? 0) + eff * 1000, nextOk.get(origin) ?? 0), true);
+      const pass = options.pass;
+      const canPass = pass?.origin === origin && eff * 1000 <= spacingMs() &&
+        (delayOf.get(origin) ?? 0) <= spacingMs() && lastHit.get(origin) === pass.last &&
+        nextOk.get(origin) === pass.next && pass.next === pass.last + spacingMs();
+      // Private, unshared calls waive only their local clock. Shared calls also need a successfully
+      // held lease and the exact stamp this robots completion wrote, checked again under reserve's lock.
+      // A stale call-owned pass is harmless: any intervening request changes these clocks/stamps.
+      const stamp = canPass && (!sharesSpacing() || (activeHeld && pass.shared?.last === pass.last && pass.shared?.next === pass.next))
+        ? (pass.shared ?? { last: pass.last, next: pass.next }) : undefined;
+      const slot = reserve(origin, eff * 1000, Math.max((lastHit.get(origin) ?? 0) + eff * 1000, nextOk.get(origin) ?? 0), true, stamp);
       const wait = slot - Date.now();
       if (wait <= 0) break;
       if (wait > 30_000) throw new Refused("The site's spacing wait is longer than Tiresias will wait.", undefined, Math.ceil(wait / 1000), url);
@@ -174,13 +188,12 @@ export class Turns {
   leaveOthers(_u?: URL): void {
     this.giveBack();
   }
-  async take(u: URL, delay: number, signal: AbortSignal): Promise<void> {
+  async take(u: URL, delay: number, signal: AbortSignal, options: TurnOptions = {}): Promise<void> {
     this.giveBack();
-    this.held = { origin: u.origin, release: await throttle(u.origin, delay, signal, u.href, true) };
+    this.held = { origin: u.origin, release: await throttle(u.origin, delay, signal, u.href, true, options) };
   }
   giveBack(): void {
     this.held?.release();
     this.held = null;
   }
 }
-

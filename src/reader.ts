@@ -7,7 +7,7 @@
 //    link markers like [3] live beside it (`marks`), never inside it.
 //  - Hostile pages must not crash us. All walks are iterative (no recursion
 //    depth limit) and capped by a node budget.
-import { parseDocument } from "./dom.js";
+import { parseDocument, type SourceScope } from "./dom.js";
 import { extractForms, publicForm, type FullForm } from "./forms.js";
 import { FLAG_TEXT } from "./files.js";
 import { hiddenReason, NOT_RENDERED, pageSheet, Shield, snippet, type HiddenSheet } from "./shield.js";
@@ -21,6 +21,7 @@ interface N {
   attribs?: Record<string, string>;
   children?: N[];
   data?: string;
+  startIndex?: number | null;
 }
 
 export const MAX_LINKS = 100;
@@ -45,11 +46,33 @@ const BOILER_WORDS = new Set([
   "subscription", "sidebar", "breadcrumb", "breadcrumbs", "advert", "advertisement", "ads", "ad", "sponsored", "promo", "popup",
   "modal", "banner", "masthead", "footer", "nav", "navbar", "menu", "comments", "disqus",
 ]);
-function boilerplate(a: Record<string, string>): boolean {
-  if (QUIET_ROLES.has((a.role ?? "").toLowerCase())) return true;
+// v1.2: never the page's root. A class, id or role on <html> or <body> describes the whole page, not a part of
+// it: Wikipedia's <html> carries "vector-feature-main-menu-pinned-disabled", and the word "menu" there dropped the
+// text of every article.
+const PAGE_ROOT = new Set(["html", "body"]);
+// v1.2: words that name a region of the layout. Sites also use them in the class of the wrapper AROUND the
+// content ("has-sidebar", "no-footer-gap", "with-product-nav__wrapper"), so these words use local surviving
+// text and semantic content to recognize wrappers (markWrappers). The other words (cookie, consent, modal,
+// newsletter and so on) name the thing itself and stay boilerplate however much of a thin page they fill.
+const LAYOUT_WORDS = new Set(["nav", "navbar", "menu", "sidebar", "footer", "banner", "masthead"]);
+// The word that makes this element boilerplate by its class or id, or null.
+function boilerWord(a: Record<string, string>): string | null {
   const names = `${a.class ?? ""} ${a.id ?? ""}`.slice(0, 500).toLowerCase();
-  for (const word of names.split(/[\s_-]+/)) if (BOILER_WORDS.has(word)) return true;
-  return false;
+  for (const word of names.split(/[\s_-]+/)) if (BOILER_WORDS.has(word)) return word;
+  return null;
+}
+// Every word in the class and id that names boilerplate is a layout word (so the wrapper rule may apply).
+function onlyLayoutWords(a: Record<string, string>): boolean {
+  const names = `${a.class ?? ""} ${a.id ?? ""}`.slice(0, 500).toLowerCase();
+  for (const word of names.split(/[\s_-]+/)) if (BOILER_WORDS.has(word) && !LAYOUT_WORDS.has(word)) return false;
+  return true;
+}
+function boilerplate(a: Record<string, string>, n?: N, wrappers?: Set<N>): boolean {
+  const name = n?.name;
+  if (name !== undefined && PAGE_ROOT.has(name.toLowerCase())) return false;
+  if (QUIET_ROLES.has((a.role ?? "").toLowerCase())) return true;
+  if (boilerWord(a) === null) return false;
+  return !(n !== undefined && wrappers?.has(n));
 }
 const BLOCK = new Set([
   "p", "div", "section", "article", "li", "ul", "ol", "tr", "table", "blockquote", "pre", "br", "hr", "main",
@@ -57,6 +80,110 @@ const BLOCK = new Set([
 ]);
 
 const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+
+// ---- W-39 (v1.2): who wrote it ----
+// Text a visitor typed into the page (comments, reviews, answers, forum posts), read from the page's own markup at
+// three levels of confidence. Markup can only ADD the mark: nothing inside a visitor's text can take it away.
+// Level 1, a formal standard: schema.org types and properties (microdata itemtype and itemprop, RDFa typeof and
+// property, and the same names in JSON-LD), and the ARIA role "comment".
+const VISITOR_TYPES = new Set(["comment", "review", "usercomments", "answer", "discussionforumposting", "socialmediaposting"]);
+const VISITOR_PROPS = new Set(["comment", "review", "reviewbody", "commenttext", "suggestedanswer", "acceptedanswer"]);
+// Level 2, a section the page names: a class or id token, or one of its parts split at - and _ (so "preview" and
+// "s-prose" do not count). Forum post bodies count as whole tokens. A token that also names a form, a link, a count
+// or a title is the site's own furniture around the comments ("comment-form", "comments-link", "reply-title"), and
+// counts for nothing. Class names inside code are a highlighter's (class="comment") and count for nothing either.
+const VISITOR_PARTS = new Set(["comments", "comment", "commentlist", "reviews", "review", "replies", "reply", "testimonials", "testimonial", "usernotes"]);
+const VISITOR_TOKENS = new Set(["comment-body", "commtext", "cooked", "post-body", "postbody", "message-body", "bbwrapper", "answercell"]);
+const FURNITURE_PARTS = new Set(["form", "respond", "link", "links", "count", "number", "title", "button", "btn", "icon", "notes", "closed", "policy"]);
+// Level 3, a heading that names visitor text, in English only for now: its following content, up to a sibling heading
+// of the same or a higher rank or the container's end, is visitor text. The whole heading must match, so
+// "Our review process" and "Peer review" do not.
+// A bare "Responses" is left out (API documentation uses it for status codes); "3 Responses to ..." counts.
+const VISITOR_HEADING = new RegExp(
+  "^(?:(?:customer|visitor|user|reader|student|guest|member|community|product|verified|recent|latest|top|all)s?'? )?" +
+    "(?:comments|replies|testimonials|(?:ratings? (?:and|&) )?reviews(?: (?:and|&) ratings?)?|user contributed notes(?: \\d[\\d,.]* notes?)?)(?: \\(\\d[\\d,.]*\\))?$" +
+    "|^(?:\\d[\\d,.]*|one) (?:comments?|reviews?|replies|reply|responses?|thoughts?)(?: (?:on|to|for) .+)?$",
+);
+export function visitorHeading(heading: string): boolean {
+  const text = norm(heading);
+  if (text.length > 200) return false;
+  return VISITOR_HEADING.test(text.toLowerCase().replace(/[‘’]/g, "'").replace(/[:.]$/, ""));
+}
+// The last part of a schema.org name, lower case: "https://schema.org/Review", "schema:Review" and "Review" are one.
+function schemaName(t: string): string {
+  let end = t.length;
+  while (end > 0 && t[end - 1] === "/") end--;
+  let start = end;
+  while (start > 0 && t[start - 1] !== "/" && t[start - 1] !== "#" && t[start - 1] !== ":") start--;
+  return t.slice(start, end).toLowerCase();
+}
+// Scan all attribute tokens, without allocating an array proportional to a hostile attribute's word count.
+function* words(v: string | undefined): Generator<string> {
+  if (v) for (const m of v.matchAll(/\S+/g)) yield m[0];
+}
+// The level an element's own attributes give its text (1 or 2), or 0.
+function visitorMark(a: Record<string, string>, inCode: boolean): 0 | 1 | 2 {
+  for (const key of ["itemtype", "typeof"]) for (const t of words(a[key])) if (VISITOR_TYPES.has(schemaName(t))) return 1;
+  for (const key of ["itemprop", "property"]) for (const p of words(a[key])) if (VISITOR_PROPS.has(schemaName(p))) return 1;
+  for (const r of words(a.role)) if (r.toLowerCase() === "comment") return 1;
+  if (inCode) return 0;
+  for (const key of ["class", "id"]) for (const token of words(a[key])) {
+    const t = token.toLowerCase();
+    if (t.length <= 32 && VISITOR_TOKENS.has(t.replace(/_/g, "-"))) return 2;
+    let visitor = false;
+    let furniture = false;
+    for (const m of t.matchAll(/[^-_]+/g)) {
+      if (FURNITURE_PARTS.has(m[0])) { furniture = true; break; }
+      if (VISITOR_PARTS.has(m[0])) visitor = true;
+    }
+    if (visitor && !furniture) return 2;
+  }
+  return 0;
+}
+type VisitorScopes = WeakMap<Record<string, string>, { visitor: number; code: boolean; normalMark?: number; codeMark?: number }>;
+// Source ancestry survives the bounded DOM's forced closes, including code's highlighter exception.
+function elementMark(a: Record<string, string>, inCode: boolean, scopes: VisitorScopes): number {
+  let inherited = scopes.get(a);
+  if (!inherited) scopes.set(a, inherited = { visitor: 0, code: false });
+  const key = inCode || inherited.code ? "codeMark" : "normalMark";
+  // A flattened parent can have thousands of children. Its long attributes are scanned once per code context.
+  const own = inherited[key] ?? (inherited[key] = visitorMark(a, key === "codeMark"));
+  return strongest(inherited.visitor, own);
+}
+// Any visitor value anywhere in parsed JSON (walked without recursion; a 5 MB document is the most it can be).
+function anyVisitorValue(root: unknown): boolean {
+  const stack: [unknown, string | undefined][] = [[root, undefined]];
+  while (stack.length) {
+    const [v, key] = stack.pop()!;
+    if (visitorValue(v, key)) return true;
+    if (Array.isArray(v)) for (const c of v) stack.push([c, undefined]);
+    else if (v && typeof v === "object") for (const [k, c] of Object.entries(v)) stack.push([c, k]);
+  }
+  return false;
+}
+// The stronger of two levels (1 is the strongest; 0 is none).
+const strongest = (x: number, y: number): number => (x && y ? Math.min(x, y) : x || y);
+const asLevel = (n: number): Block["visitor"] => (n === 1 || n === 2 || n === 3 ? n : undefined);
+// A JSON-LD value a visitor wrote: one under a visitor property, or an object of a visitor type.
+function visitorValue(v: unknown, key: string | undefined): boolean {
+  if (key !== undefined && VISITOR_PROPS.has(schemaName(key))) return true;
+  return !!v && typeof v === "object" && !Array.isArray(v) && typeOf(v).some((t) => VISITOR_TYPES.has(schemaName(t)));
+}
+
+// v1.2: extraction and scoring agree about destinations, independently of the link-list cap.
+// Keep the overlong case separate so extraction can still report omitted URLs.
+function linkDestination(href: string | undefined, base: string): { url: string } | { tooLong: true } | null {
+  if (!href) return null;
+  let u: URL;
+  try {
+    u = new URL(href.trim(), base);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  u.hash = "";
+  return u.href.length > MAX_URL ? { tooLong: true } : { url: u.href };
+}
 
 // Collapse whitespace while tracking where link markers land in the result.
 function collapse(parts: (string | number)[]): Block {
@@ -102,7 +229,7 @@ function splitBlock(b: Block): Block[] {
     end = splitEnd(b.text, end);
     const lo = start;
     const marks = b.marks.filter(([pos]) => (pos > lo || lo === 0) && pos <= end).map(([pos, n]) => [pos - lo, n] as [number, number]);
-    out.push({ text: b.text.slice(start, end), marks });
+    out.push({ text: b.text.slice(start, end), marks, ...(b.visitor ? { visitor: b.visitor } : {}) });
     start = end;
     while (b.text[start] === " ") start++;
   }
@@ -134,7 +261,23 @@ class Builder {
   main: Set<N> | null = null; // W-22: the main content's element and its ancestors, when one was found
   inMain = new Set<N>(); // every node inside the main content element
   parentOf = new Map<N, N>();
+  wrappers = new Set<N>(); // v1.2: layout-named elements kept by local surviving text (markWrappers)
+  // W-39: the level of the visitor markup around the node being read (0: none), the strongest level among the text
+  // waiting in `parts`, the source heading regions, and code depth.
+  visitor = 0;
+  partsVisitor = 0;
+  headingVisitors = new WeakSet<N>(); // v1.2: source heading scopes, independent of main-content selection
+  visitorScopes: VisitorScopes = new WeakMap();
+  code = 0;
   constructor(public shield: Shield, public base: string) {}
+  // W-39: the level a block made now gets: its own text's, or the heading region's.
+  private by(own: number): Block["visitor"] {
+    return asLevel(own);
+  }
+  private take(): void {
+    this.parts = [];
+    this.partsVisitor = 0;
+  }
   // A preformatted block, kept exactly, fenced.
   // The pending marker of a list item, taken to lead a block written directly (a <pre>: round 79).
   // Outside an item, or for an item already led, the continuation indent (round 80).
@@ -142,14 +285,14 @@ class Builder {
     const item = this.items[this.items.length - 1];
     if (!this.loneMarker()) return item?.led ? item.indent : "";
     const m = this.parts.filter((p) => typeof p === "string").join("").replace(/\s+$/, ""); // nesting indent kept
-    this.parts = [];
+    this.take();
     this.marker = false;
     if (item) item.led = true;
     return m + " ";
   }
   // `indent` goes in front of EVERY line of the block, its fences included, so a <pre> inside a list item
   // stays inside it (Codex round 81); the first chunk starts with `lead` (the item's marker) instead.
-  pre(raw: string, marks: [number, number][] = [], lead = "", indent = "") {
+  pre(raw: string, marks: [number, number][] = [], lead = "", indent = "", visitor = this.visitor) {
     if (!this.cur) this.startTop();
     for (let i = 0; i < raw.length; ) {
       const end = splitEnd(raw, Math.min(i + MAX_BLOCK, raw.length));
@@ -167,7 +310,8 @@ class Builder {
           const lines = indent ? piece.slice(0, p).split("\n").length : 0; // lines up to the mark, each indented
           return [head.length + fence.length + 1 + p + indent.length * lines, n] as [number, number];
         });
-      this.cur!.blocks.push({ text: `${head}${fence}\n${body}\n${indent}${fence}`, marks: m });
+      const by = this.by(visitor);
+      this.cur!.blocks.push({ text: `${head}${fence}\n${body}\n${indent}${fence}`, marks: m, ...(by ? { visitor: by } : {}) });
       this.shield.scan(piece, "visible text");
       i = end;
     }
@@ -179,13 +323,16 @@ class Builder {
     this.start(0, "(top of page)");
     this.cur!.generated = true;
   }
-  start(level: number, heading: string) {
+  start(level: number, heading: string, visitor = 0) {
     this.shield.scan(heading, "heading"); // headings are returned text too
     // The heading shown in the outline is bounded. The full text is not lost:
     // an overlong heading also becomes the section's first block, so it can
     // be expanded, searched and quoted.
     this.cur = { n: this.sections.length + 1, level, heading: heading.slice(0, MAX_HEADING), blocks: [] };
-    if (heading.length > MAX_HEADING) this.cur.blocks.push(...splitBlock({ text: heading, marks: [] }));
+    if (visitor) this.cur.visitor = asLevel(visitor); // the heading itself, independently of the following blocks
+    // W-39: a visitor's overlong heading stays the visitor's.
+    const by = this.by(visitor);
+    if (heading.length > MAX_HEADING) this.cur.blocks.push(...splitBlock({ text: heading, marks: [], ...(by ? { visitor: by } : {}) }));
     this.sections.push(this.cur);
   }
   marker = false; // a list item's marker was pushed and has not yet led any content
@@ -193,7 +340,7 @@ class Builder {
     return this.marker && !collapse(this.parts.filter((p) => typeof p === "string")).text.replace(/^\s*(-|-?\d+\.)\s*$/, "");
   }
   dropLoneMarker(): void {
-    if (this.loneMarker()) this.parts = [];
+    if (this.loneMarker()) this.take();
     this.marker = false;
   }
   items: { indent: string; led: boolean }[] = []; // open list items: their continuation indent (round 79)
@@ -213,7 +360,10 @@ class Builder {
       b.text = indent + b.text;
       b.marks = b.marks.map(([pos, n]) => [pos + indent.length, n] as [number, number]);
     }
-    this.parts = [];
+    // W-39: a block holding any visitor text is the visitor's (a mixed paragraph errs toward the visitor).
+    const by = this.by(this.partsVisitor);
+    if (by) b.visitor = by;
+    this.take();
     if (!b.text) return;
     if (!this.cur) this.startTop();
     // Every piece of a long block in a list item stays under the item (round 82): the pieces after the
@@ -222,14 +372,14 @@ class Builder {
     const cont = item ? item.indent : "";
     this.cur!.blocks.push(
       ...pieces.map((pc, k) =>
-        k > 0 && cont ? { text: cont + pc.text, marks: pc.marks.map(([pos, n]) => [pos + cont.length, n] as [number, number]) } : pc,
+        k > 0 && cont ? { ...pc, text: cont + pc.text, marks: pc.marks.map(([pos, n]) => [pos + cont.length, n] as [number, number]) } : pc,
       ),
     );
     this.shield.scan(b.text, "visible text");
   }
   takeHeading(): string {
     const t = collapse(this.parts.filter((p) => typeof p === "string")).text;
-    this.parts = [];
+    this.take();
     // A heading that took a pending list marker leads its item (round 83).
     if (this.marker) {
       this.marker = false;
@@ -243,7 +393,7 @@ class Builder {
   flushLoneMarker(): void {
     if (!this.loneMarker()) return;
     const m = this.parts.filter((p) => typeof p === "string").join("").replace(/\s+$/, "");
-    this.parts = [];
+    this.take();
     this.marker = false;
     const item = this.items[this.items.length - 1];
     if (item) item.led = true;
@@ -252,27 +402,21 @@ class Builder {
   }
   // Returns the link number, or 0 if it is not a followable link or the cap is hit.
   link(href: string | undefined, text: string): number {
-    if (!href) return 0;
-    let u: URL;
-    try {
-      u = new URL(href.trim(), this.base);
-    } catch {
-      return 0;
-    }
-    if (u.protocol !== "http:" && u.protocol !== "https:") return 0;
-    u.hash = "";
-    if (u.href.length > MAX_URL) {
+    const destination = linkDestination(href, this.base);
+    if (!destination) return 0;
+    if ("tooLong" in destination) {
       this.omitted++; // a shortened URL is a different destination, so it is left out and counted
       return 0;
     }
-    const known = this.byUrl.get(u.href);
+    const url = destination.url;
+    const known = this.byUrl.get(url);
     if (known) return known;
     if (this.links.length >= MAX_LINKS) return 0;
     const n = this.links.length + 1;
     const label = snippet(text, 0, 80);
     this.shield.scan(label, "link text");
-    this.links.push({ n, url: u.href, text: label });
-    this.byUrl.set(u.href, n);
+    this.links.push({ n, url, text: label });
+    this.byUrl.set(url, n);
     return n;
   }
 }
@@ -294,12 +438,13 @@ function visibleText(root: N, cap = 300, sheet?: HiddenSheet): string {
 // The text of a <pre>, white space kept, under the SAME rules as the main walk (Codex round 69): elements
 // that are not rendered are skipped, hidden ones are flagged and left out, and <br> is a line break.
 // Links inside it are collected like anywhere else and get their [n] marker (Codex round 76).
-function preText(root: N, b: Builder, cap: number, marks: [number, number][] = []): string {
+function preText(root: N, b: Builder, cap: number, marks: [number, number][] = []): { text: string; visitor: number } {
   let out = "";
+  let visitor = 0;
   // quiet: inside boilerplate (nav, footer, aside, an advert...): its text is left out as in the main walk,
   // its links are still collected (Codex round 93: a <pre> brought suppressed text back).
-  type It = { n: N; quiet: boolean } | { mark: number };
-  const stack: It[] = [...(root.children ?? [])].reverse().map((n) => ({ n, quiet: false }));
+  type It = { n: N; quiet: boolean; visitor: number } | { mark: number };
+  const stack: It[] = [...(root.children ?? [])].reverse().map((n) => ({ n, quiet: false, visitor: b.visitor }));
   let seen = 0;
   while (stack.length && out.length < cap) {
     const item = stack.pop()!;
@@ -313,7 +458,10 @@ function preText(root: N, b: Builder, cap: number, marks: [number, number][] = [
     const { n } = item;
     let quiet = item.quiet;
     if (n.type === "text") {
-      if (!quiet) out += n.data ?? "";
+      if (!quiet) {
+        out += n.data ?? "";
+        if (/\S/.test(n.data ?? "")) visitor = strongest(visitor, strongest(item.visitor, b.headingVisitors.has(n) ? 3 : 0));
+      }
       continue;
     }
     if (n.type === "comment") {
@@ -329,15 +477,16 @@ function preText(root: N, b: Builder, cap: number, marks: [number, number][] = [
       if (txt) b.shield.hidden(why, txt);
       continue;
     }
-    if (QUIET.has(n.name!) || boilerplate(attribs)) quiet = true;
+    if (QUIET.has(n.name!) || boilerplate(attribs, n, b.wrappers)) quiet = true;
     if (n.name === "br" && !quiet) out += "\n";
     if (n.name === "a") {
       const num = b.link(attribs.href, visibleText(n, 300, b.shield.sheet));
       if (num && !quiet) stack.push({ mark: num });
     }
-    for (let i = (n.children ?? []).length - 1; i >= 0; i--) stack.push({ n: n.children![i], quiet });
+    const mark = strongest(item.visitor, elementMark(attribs, true, b.visitorScopes));
+    for (let i = (n.children ?? []).length - 1; i >= 0; i--) stack.push({ n: n.children![i], quiet, visitor: mark });
   }
-  return out;
+  return { text: out, visitor };
 }
 
 function rawText(root: N, cap = 5000): string {
@@ -352,14 +501,16 @@ function rawText(root: N, cap = 5000): string {
   return out;
 }
 
-type Task = { n: N; quiet: boolean } | (() => void);
+type Task = { n: N; quiet: boolean; parent?: N } | (() => void);
 
 function pushChildren(stack: Task[], n: N, quiet: boolean) {
   const ch = n.children ?? [];
-  for (let i = ch.length - 1; i >= 0; i--) stack.push({ n: ch[i], quiet });
+  for (let i = ch.length - 1; i >= 0; i--) stack.push({ n: ch[i], quiet, parent: n });
 }
 
-function walk(root: N, b: Builder): void {
+type HeadingText = WeakMap<N, { text: string; visitor: number }>;
+
+function walk(root: N, b: Builder, headings?: HeadingText): void {
   const stack: Task[] = [{ n: root, quiet: false }];
   let count = 0;
   while (stack.length) {
@@ -373,7 +524,10 @@ function walk(root: N, b: Builder): void {
     let quiet = t.quiet;
     if (n.type === "text") {
       // A "|" inside a table cell is escaped, so only Tiresias's own separators split cells (round 78).
-      if (!quiet) b.parts.push(b.rowDepth > 0 ? (n.data ?? "").replace(/\\/g, "\\\\").replace(/\|/g, "\\|") : n.data ?? "");
+      if (!quiet) {
+        b.parts.push(b.rowDepth > 0 ? (n.data ?? "").replace(/\\/g, "\\\\").replace(/\|/g, "\\|") : n.data ?? "");
+        if (/\S/.test(n.data ?? "")) b.partsVisitor = strongest(b.partsVisitor, strongest(b.visitor, b.headingVisitors.has(n) ? 3 : 0)); // W-39
+      }
       continue;
     }
     if (n.type === "comment") {
@@ -394,7 +548,19 @@ function walk(root: N, b: Builder): void {
     }
     for (const a of ["alt", "title"]) if (attribs[a]) b.shield.scan(attribs[a], `${a} attribute`);
     if (name === "script" || SKIP.has(name)) continue;
-    if (QUIET.has(name) || boilerplate(attribs) || (b.main !== null && !b.main.has(n) && !b.inMain.has(n))) quiet = true;
+    if (QUIET.has(name) || boilerplate(attribs, n, b.wrappers) || (b.main !== null && !b.main.has(n) && !b.inMain.has(n))) quiet = true;
+    // W-39: this element's own visitor mark holds for everything inside it, until its end (the restore runs after
+    // its children and their own closing steps). Class names on or inside code and pre are a highlighter's.
+    if (name === "code" || name === "pre") {
+      b.code++;
+      stack.push(() => void b.code--);
+    }
+    const mark = elementMark(attribs, b.code > 0, b.visitorScopes);
+    if (mark && strongest(b.visitor, mark) !== b.visitor) {
+      const outer = b.visitor;
+      b.visitor = strongest(outer, mark);
+      stack.push(() => void (b.visitor = outer));
+    }
     // Inside a table row, block elements (paragraphs, lists, headings, pre, nested rows) do not end the
     // row: their text joins the cell (Codex round 76).
     const inRow = b.rowDepth > 0;
@@ -405,10 +571,10 @@ function walk(root: N, b: Builder): void {
       const marks: [number, number][] = [];
       const full = preText(n, b, Infinity, marks);
       let lead = 0;
-      while (full.charCodeAt(lead) === 10) lead++; // leading newlines, linearly (Codex round 75: the old regex was quadratic)
-      const raw = full.slice(lead).trimEnd();
+      while (full.text.charCodeAt(lead) === 10) lead++; // leading newlines, linearly (Codex round 75: the old regex was quadratic)
+      const raw = full.text.slice(lead).trimEnd();
       const itemIndent = b.items.length ? b.items[b.items.length - 1].indent : "";
-      if (raw.trim()) b.pre(raw, marks.map(([pos, num]) => [Math.min(pos - lead, raw.length), num] as [number, number]), b.takeLoneMarker(), itemIndent);
+      if (raw.trim()) b.pre(raw, marks.map(([pos, num]) => [Math.min(pos - lead, raw.length), num] as [number, number]), b.takeLoneMarker(), itemIndent, strongest(b.visitor, full.visitor));
       continue;
     }
     if (!quiet && (name === "ul" || name === "ol")) {
@@ -481,8 +647,10 @@ function walk(root: N, b: Builder): void {
       b.flush();
       const level = Number(name[1]);
       stack.push(() => {
+        const by = b.partsVisitor;
         const heading = b.takeHeading();
-        if (heading) b.start(level, heading);
+        headings?.set(n, { text: heading, visitor: by });
+        if (heading) b.start(level, heading, by);
       });
       pushChildren(stack, n, quiet);
       continue;
@@ -506,6 +674,20 @@ function walk(root: N, b: Builder): void {
   }
 }
 
+// v1.2: use the extraction walk before main selection can quiet a source heading. Both ends of a
+// region use its joined, normalised text and visible descendants' attribution. The separate builder
+// and shield discard this pass's body and flags; only the heading summaries survive into the final walk.
+function sourceHeadings(root: N, b: Builder): HeadingText {
+  const shield = new Shield();
+  shield.sheet = b.shield.sheet;
+  const reader = new Builder(shield, b.base);
+  reader.visitorScopes = b.visitorScopes;
+  reader.wrappers = b.wrappers;
+  const headings: HeadingText = new WeakMap();
+  walk(root, reader, headings);
+  return headings;
+}
+
 // W-22 (v0.5.1): main-content scoring, in-house (no library). Every element's visible text and link text
 // are summed in one pass from the leaves up. The main content is a <main> (or role=main) element with real
 // text; else the <article> with the most text; else the container whose text, less its link text, is
@@ -515,34 +697,95 @@ function walk(root: N, b: Builder): void {
 // the walk, the page's own style rules included), and boilerplate. So invisible filler cannot win.
 const unscored = (n: N, b: Builder): boolean =>
   (n.type === "tag" || n.type === "script" || n.type === "style") &&
-  (SKIP.has(n.name!) || n.name === "script" || QUIET.has(n.name!) || boilerplate(n.attribs ?? {}) || hiddenReason(n.attribs ?? {}, b.shield.sheet) !== null);
+  (SKIP.has(n.name!) || n.name === "script" || QUIET.has(n.name!) || boilerplate(n.attribs ?? {}, n, b.wrappers) || hiddenReason(n.attribs ?? {}, b.shield.sheet) !== null);
+
+// v1.2: a bounded preorder for both scoring passes. Link membership belongs to text nodes and is inherited
+// from any enclosing destination anchor, including one outside the element being scored.
+function textOrder(root: N, b: Builder, dead: (n: N) => boolean, parent?: Map<N, N>): { order: N[]; linked: Set<N> } {
+  const order: N[] = [];
+  const linked = new Set<N>();
+  const stack = [{ n: root, inLink: false }];
+  let count = 0;
+  while (stack.length) {
+    const { n, inLink } = stack.pop()!;
+    if (++count > MAX_NODES) throw new ComplexityError();
+    order.push(n);
+    if (dead(n)) continue;
+    if (n.type === "text" && inLink) linked.add(n);
+    const destination = n.name === "a" ? linkDestination(n.attribs?.href, b.base) : null;
+    const nextLink = inLink || (destination !== null && "url" in destination);
+    for (const c of n.children ?? []) {
+      parent?.set(c, n);
+      stack.push({ n: c, inLink: nextLink });
+    }
+  }
+  return { order, linked };
+}
+
+// v1.2: layout-named wrappers are decided locally, children before parents. Rejected children contribute
+// nothing. A semantic main, a substantial article, or a wrapper containing substantial semantic content is
+// kept even inside one big link; otherwise substantial text must be at most half destination-link text.
+export const WRAPPER_MIN = 200;
+export const WRAPPER_MAX_LINK_SHARE = 0.5; // a candidate whose text is mostly link text is the navigation itself
+function markWrappers(root: N, b: Builder): void {
+  // Counted as nothing, and not entered: what the reader never shows (skipped, script, hidden), and what it always
+  // quiets whatever this pass decides: nav, footer, aside, the quiet roles (Codex round 1, LOW), and an element
+  // named by a word that is not a layout word, such as a cookie box (Codex round 3: its text is dropped later, so
+  // counting it here would let it dilute a menu's share of links).
+  const dead = (n: N): boolean =>
+    (n.type === "tag" || n.type === "script" || n.type === "style") &&
+    (SKIP.has(n.name!) ||
+      n.name === "script" ||
+      QUIET.has(n.name!) ||
+      (!PAGE_ROOT.has(n.name!) && (QUIET_ROLES.has((n.attribs?.role ?? "").toLowerCase()) || !onlyLayoutWords(n.attribs ?? {}))) ||
+      hiddenReason(n.attribs ?? {}, b.shield.sheet) !== null);
+  const main = (n: N): boolean => n.name === "main" || (n.attribs?.role ?? "").toLowerCase() === "main";
+  const semantic = (n: N): boolean => main(n) || n.name === "article";
+  const { order, linked } = textOrder(root, b, dead);
+  const text = new Map<N, number>();
+  const link = new Map<N, number>(); // of that text, how much sits inside links
+  const holdsMain = new Set<N>(); // contains surviving semantic content with at least WRAPPER_MIN text
+  for (let i = order.length - 1; i >= 0; i--) {
+    const n = order[i];
+    let t = n.type === "text" ? norm(n.data ?? "").length : 0;
+    let l = linked.has(n) ? t : 0;
+    let holds = false;
+    if (!dead(n)) {
+      for (const c of n.children ?? []) {
+        t += text.get(c) ?? 0;
+        l += link.get(c) ?? 0;
+        if (holdsMain.has(c)) holds = true;
+      }
+    } else t = 0;
+    if (n.type === "tag" && !dead(n) && !PAGE_ROOT.has(n.name!) && boilerWord(n.attribs ?? {}) !== null) {
+      const itself = main(n) || (n.name === "article" && t >= WRAPPER_MIN);
+      const bySize = t >= WRAPPER_MIN && l <= t * WRAPPER_MAX_LINK_SHARE;
+      if (itself || holds || bySize) b.wrappers.add(n);
+      else {
+        t = 0;
+        l = 0;
+        holds = false;
+      }
+    }
+    text.set(n, t);
+    link.set(n, l);
+    if (holds || (semantic(n) && t >= WRAPPER_MIN)) holdsMain.add(n);
+  }
+}
 
 function chooseMain(root: N, b: Builder): void {
   const text = new Map<N, number>();
   const link = new Map<N, number>();
-  const order: N[] = [];
-  const stack: N[] = [root];
-  let count = 0;
-  while (stack.length) {
-    const n = stack.pop()!;
-    if (++count > MAX_NODES) throw new ComplexityError();
-    order.push(n);
-    if (unscored(n, b)) continue;
-    for (const c of n.children ?? []) {
-      b.parentOf.set(c, n);
-      stack.push(c);
-    }
-  }
+  const { order, linked } = textOrder(root, b, (n) => unscored(n, b), b.parentOf);
   for (let i = order.length - 1; i >= 0; i--) {
     const n = order[i];
     let t = n.type === "text" ? norm(n.data ?? "").length : 0;
-    let l = 0;
+    let l = linked.has(n) ? t : 0;
     if (unscored(n, b)) t = 0;
     else for (const c of n.children ?? []) {
       t += text.get(c) ?? 0;
       l += link.get(c) ?? 0;
     }
-    if (n.name === "a") l = t;
     text.set(n, t);
     link.set(n, l);
   }
@@ -599,8 +842,9 @@ function chooseMain(root: N, b: Builder): void {
 
 interface Found {
   title?: N;
+  headingVisitors: WeakSet<N>;
   base?: N;
-  ld: N[];
+  ld: { n: N; visitor: number }[];
   links: N[];
   metas: N[];
   lang?: string;
@@ -608,22 +852,38 @@ interface Found {
   byline?: N; // the first rel=author link or byline element
 }
 
-function scanHead(root: N): Found {
-  const found: Found = { ld: [], links: [], metas: [] };
-  const stack: N[] = [root];
+function scanHead(root: N, scopes: VisitorScopes = new WeakMap(), source: WeakMap<Record<string, string>, SourceScope> = new WeakMap(), sheet?: HiddenSheet, headings?: HeadingText): Found {
+  const found: Found = { ld: [], links: [], metas: [], headingVisitors: new WeakSet() };
+  const stack = [{ n: root, visitor: 0, code: false, headingHidden: false }];
+  let region: { level: number; container: object; start: number; end: number } | undefined;
   let count = 0;
   while (stack.length) {
-    const n = stack.pop()!;
+    const item = stack.pop()!;
+    const { n } = item;
     if (++count > MAX_NODES) throw new ComplexityError();
+    if (region && (n.startIndex ?? -1) >= region.end) region = undefined;
+    const code = item.code || n.name === "code" || n.name === "pre";
+    const visitor = strongest(item.visitor, elementMark(n.attribs ?? {}, code, scopes));
+    const headingHidden = item.headingHidden || SKIP.has(n.name ?? "") || hiddenReason(n.attribs ?? {}, sheet) !== null;
+    // v1.2: source headings identify visitor text before main-content selection can quiet them.
+    // The same regions apply to ordinary text and to JSON-LD, including flattened source containers.
+    const heading = headings?.get(n);
+    if (!headingHidden && !visitor && !code && heading?.text && !heading.visitor) {
+      const level = Number(n.name![1]);
+      const parent = source.get(n.attribs ?? {})?.parent ?? root;
+      if (region?.container === parent && level <= region.level) region = undefined;
+      if (!region && visitorHeading(heading.text)) region = { level, container: parent, start: source.get(n.attribs ?? {})?.end ?? Infinity, end: source.get(parent as Record<string, string>)?.end ?? Infinity };
+    }
+    if (region && (n.startIndex ?? -1) >= region.start) found.headingVisitors.add(n);
     if (n.name === "title" && !found.title) found.title = n;
-    else if (n.name === "script" && /ld\+json/i.test(n.attribs?.type ?? "")) found.ld.push(n);
+    else if (n.name === "script" && /ld\+json/i.test(n.attribs?.type ?? "")) found.ld.push({ n, visitor: strongest(visitor, region ? 3 : 0) });
     else if (n.name === "base" && !found.base && n.attribs?.href !== undefined) found.base = n;
     else if (n.name === "link") found.links.push(n);
     else if (n.name === "meta" && found.metas.length < 200) found.metas.push(n);
     else if (n.name === "html" && n.attribs?.lang && !found.lang) found.lang = n.attribs.lang;
     else if (n.name === "time" && n.attribs?.datetime && !found.time) found.time = n.attribs.datetime;
     if (!found.byline && n.type === "tag" && (/(^|\s)author(\s|$)/i.test(n.attribs?.rel ?? "") || /(^|[\s_-])(byline|author)([\s_-]|$)/i.test(n.attribs?.class ?? ""))) found.byline = n;
-    if (n.children) for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]);
+    if (n.children) for (let i = n.children.length - 1; i >= 0; i--) stack.push({ n: n.children[i], visitor, code, headingHidden });
   }
   return found;
 }
@@ -681,7 +941,17 @@ function finish(b: Builder, base: Partial<ParsedPage>): ParsedPage {
 // of the line), so a change still only moves the blocks around it. A line longer than MAX_BLOCK is cut.
 // Each block is an exact piece of the text, so a quote of it is a real substring.
 const MAX_LINE_BLOCKS = 5000;
-export function lineBlocks(text: string): Block[] {
+// W-39: `spans` (sorted, not overlapping: boundedPretty's) marks every block that touches one as written by a visitor.
+export function lineBlocks(text: string, spans?: [number, number][]): Block[] {
+  const blocks = lineSlices(text);
+  if (!spans?.length) return blocks.map(([a, b]) => ({ text: text.slice(a, b), marks: [] }));
+  let i = 0;
+  return blocks.map(([a, b]) => {
+    while (i < spans.length && spans[i][1] <= a) i++;
+    return { text: text.slice(a, b), marks: [], ...(i < spans.length && spans[i][0] < b ? { visitor: 1 as const } : {}) };
+  });
+}
+function lineSlices(text: string): [number, number][] {
   // Lines as [start, end) offsets into the text, so every block is an exact slice of it (Codex round 75:
   // joining kept lines with "\n" dropped the blank lines between them and made quotes that are not in
   // the text).
@@ -696,8 +966,8 @@ export function lineBlocks(text: string): Block[] {
     }
     i = j + 1;
   }
-  if (lines.length <= MAX_LINE_BLOCKS) return lines.map(([a, b]) => ({ text: text.slice(a, b), marks: [] }));
-  const out: Block[] = [];
+  if (lines.length <= MAX_LINE_BLOCKS) return lines;
+  const out: [number, number][] = [];
   let start = -1;
   let end = -1;
   const cut = (l: string) => {
@@ -708,16 +978,16 @@ export function lineBlocks(text: string): Block[] {
   for (const [a, b] of lines) {
     if (start === -1) start = a;
     else if (b - start > MAX_BLOCK) {
-      out.push({ text: text.slice(start, end), marks: [] }); // a run never grows past MAX_BLOCK
+      out.push([start, end]); // a run never grows past MAX_BLOCK
       start = a;
     }
     end = b;
     if (cut(text.slice(a, b))) {
-      out.push({ text: text.slice(start, end), marks: [] });
+      out.push([start, end]);
       start = -1;
     }
   }
-  if (start !== -1) out.push({ text: text.slice(start, end), marks: [] });
+  if (start !== -1) out.push([start, end]);
   return out;
 }
 
@@ -739,17 +1009,19 @@ export function parseHtml(html: string, baseUrl: string, keep?: { forms?: FullFo
   const doc = tree.doc as unknown as N;
   const shield = new Shield();
   shield.sheet = pageSheet(doc);
+  const visitorScopes: VisitorScopes = new WeakMap();
   if (rendered && /^data-t-[0-9a-f]{16}$/.test(rendered.mark)) shield.sheet.rendered = { mark: rendered.mark, complete: rendered.complete === true };
   if (tree.flattened) {
     shield.sheet.inherited = new WeakMap();
     const reasons = new WeakMap<Record<string, string>, string | null>();
-    for (const [attrs, parent] of tree.inherited) {
+    for (const [attrs, parent, code] of tree.inherited) {
       let why = reasons.get(parent);
       if (why === undefined) reasons.set(parent, why = hiddenReason(parent, shield.sheet));
       if (why) shield.sheet.inherited.set(attrs, why);
+      visitorScopes.set(attrs, { visitor: elementMark(parent, code, visitorScopes), code });
     }
   }
-  const found = scanHead(doc);
+  let found = scanHead(doc, visitorScopes, tree.source, shield.sheet);
   let linkBase = baseUrl;
   try {
     const base = new URL(found.base?.attribs?.href ?? "", baseUrl);
@@ -758,6 +1030,10 @@ export function parseHtml(html: string, baseUrl: string, keep?: { forms?: FullFo
     // An unusable first base leaves links relative to the fetched page.
   }
   const b = new Builder(shield, linkBase);
+  b.visitorScopes = visitorScopes;
+  markWrappers(doc, b);
+  found = scanHead(doc, visitorScopes, tree.source, shield.sheet, sourceHeadings(doc, b));
+  b.headingVisitors = found.headingVisitors;
   chooseMain(doc, b);
   walk(doc, b);
   b.flush();
@@ -794,10 +1070,12 @@ export function parseHtml(html: string, baseUrl: string, keep?: { forms?: FullFo
   // parsed, never executed, and phrases inside it are flagged.
   const types = new Set<string>();
   const rawParts: string[] = [];
+  const partSpans: [number, number][][] = [];
+  const partVisitors: number[] = [];
   let used = 0;
   const skipped = { invalid: 0, too_large: 0 };
   for (const s of found.ld) {
-    const raw = rawText(s, MAX_STRUCTURED).trim();
+    const raw = rawText(s.n, MAX_STRUCTURED).trim();
     if (!raw) continue;
     if (used + raw.length > MAX_STRUCTURED) {
       skipped.too_large++; // reported with a reason, not silent
@@ -812,13 +1090,20 @@ export function parseHtml(html: string, baseUrl: string, keep?: { forms?: FullFo
       // The bounded printer stops at the remaining budget (Codex round 78: printing whole first could use
       // far more memory than the cap); a print that does not fit whole keeps the raw text.
       let pretty = raw;
+      // W-39: where the visitor values (reviews, comments, answers) are in the text kept. Raw text kept whole is
+      // the visitor's throughout when any value in it is.
+      let spans: [number, number][] = [];
+      let printed = false;
       try {
-        const p = boundedPretty(data, Math.max(0, MAX_STRUCTURED - used));
-        if (!p.omitted && p.exact) pretty = p.text;
+        const p = boundedPretty(data, Math.max(0, MAX_STRUCTURED - used), spans);
+        if (!p.omitted && p.exact) (pretty = p.text), (printed = true);
       } catch {
         // keep raw
       }
+      if (!printed) spans = anyVisitorValue(data) ? [[0, raw.length]] : [];
       rawParts.push(pretty);
+      partSpans.push(spans);
+      partVisitors.push(s.visitor);
       used += pretty.length;
     } catch {
       skipped.invalid++; // bad JSON-LD is common; it is counted so the omission is visible
@@ -829,7 +1114,10 @@ export function parseHtml(html: string, baseUrl: string, keep?: { forms?: FullFo
   page.searchable_chars += used;
   page.structured_skipped = skipped.invalid || skipped.too_large ? skipped : undefined;
   if (rawParts.length) {
-    page.sections.push({ n: page.sections.length + 1, level: 0, heading: "(structured data)", generated: true, blocks: rawParts.flatMap(lineBlocks) });
+    page.sections.push({ n: page.sections.length + 1, level: 0, heading: STRUCTURED_HEADING, generated: true, blocks: rawParts.flatMap((part, i) => lineBlocks(part, partSpans[i]).map((b) => {
+      const visitor = asLevel(strongest(b.visitor ?? 0, partVisitors[i]));
+      return visitor ? { ...b, visitor } : b;
+    })) });
   }
   // W-04: the page's forms, as fields. Labels and option texts are returned text, so the shield reads them.
   const fx = extractForms(doc, baseUrl, tree.flattened);
@@ -1156,7 +1444,9 @@ export const MAX_PRETTY_DEPTH = 100_000;
 // keeps counting the length of what it does not write, so the omitted count is exact and costs
 // arithmetic, not memory. Returns { text, omitted, exact }: `exact` is false only when the nesting
 // passed MAX_PRETTY_DEPTH, and then `omitted` is a lower bound.
-export function boundedPretty(root: unknown, max = MAX_EXPANDED): { text: string; omitted: number; exact: boolean } {
+// W-39: with `spans`, it also records where each visitor value (visitorValue) starts and ends in the text, outermost
+// only: a review's whole object, its author included, is the visitor's.
+export function boundedPretty(root: unknown, max = MAX_EXPANDED, spans?: [number, number][]): { text: string; omitted: number; exact: boolean } {
   const out: string[] = [];
   let used = 0; // characters kept
   let total = 0; // characters the full output would have
@@ -1185,21 +1475,30 @@ export function boundedPretty(root: unknown, max = MAX_EXPANDED): { text: string
     i: number;
     n: number;
     depth: number;
+    span?: number; // W-39: where this visitor value began
   }
   const stack: Frame[] = [];
   let exact = true;
-  const value = (v: unknown, depth: number) => {
-    if (typeof v !== "object" || v === null) return put(JSON.stringify(v) ?? "null");
+  let open = 0; // W-39: visitor values being printed
+  // A value with no children: written whole, so its span (if it starts one) closes here too.
+  const leaf = (s: string, span: number | undefined) => {
+    put(s);
+    if (span !== undefined) spans!.push([span, used]);
+  };
+  const value = (v: unknown, depth: number, key?: string) => {
+    const span = spans && open === 0 && visitorValue(v, key) ? used : undefined;
+    if (typeof v !== "object" || v === null) return leaf(JSON.stringify(v) ?? "null", span);
     if (Array.isArray(v)) {
-      if (v.length === 0) return put("[]");
+      if (v.length === 0) return leaf("[]", span);
       put("[");
-      stack.push({ arr: v, i: 0, n: v.length, depth });
+      stack.push(span === undefined ? { arr: v, i: 0, n: v.length, depth } : { arr: v, i: 0, n: v.length, depth, span });
     } else {
       const keys = Object.keys(v);
-      if (keys.length === 0) return put("{}");
+      if (keys.length === 0) return leaf("{}", span);
       put("{");
-      stack.push({ obj: v as Record<string, unknown>, keys, i: 0, n: keys.length, depth });
+      stack.push(span === undefined ? { obj: v as Record<string, unknown>, keys, i: 0, n: keys.length, depth } : { obj: v as Record<string, unknown>, keys, i: 0, n: keys.length, depth, span });
     }
+    if (span !== undefined) open++;
   };
   value(root, 0);
   while (stack.length) {
@@ -1212,18 +1511,23 @@ export function boundedPretty(root: unknown, max = MAX_EXPANDED): { text: string
       if (f.i > 0) put(",");
       line(f.depth + 1);
       let child: unknown;
+      let key: string | undefined;
       if (f.arr) child = f.arr[f.i];
       else {
-        const k = f.keys![f.i];
-        put(JSON.stringify(k) + ": ");
-        child = f.obj![k];
+        key = f.keys![f.i];
+        put(JSON.stringify(key) + ": ");
+        child = f.obj![key];
       }
       f.i++;
-      value(child, f.depth + 1);
+      value(child, f.depth + 1, key);
     } else {
       stack.pop();
       line(f.depth);
       put(f.arr ? "]" : "}");
+      if (f.span !== undefined) {
+        spans!.push([f.span, used]);
+        open--;
+      }
     }
   }
   return { text: out.join(""), omitted: Math.max(0, total - max), exact };
@@ -1345,22 +1649,39 @@ export interface Passage {
   heading: string;
   text: string; // exact extracted text, at most MAX_BLOCK characters
   score: number;
+  visitor?: Block["visitor"]; // W-39: the block's own mark (never sent as is: pipeline.ts takes it off)
 }
+
+// The label of the section Tiresias makes from a page's JSON-LD.
+export const STRUCTURED_HEADING = "(structured data)";
+// A line of structured data longer than this is a copy of the page's text (an article's whole body, often as
+// escaped HTML), not a fact such as a price or a date. A long line holds many words, so by word overlap alone it
+// outranked the article's own paragraphs (field list, 2026-11-14). Such a line is ranked after every other
+// passage: it is still returned when little else matches.
+export const STRUCTURED_COPY = 500;
 
 // Plain keyword overlap. Honest and boring on purpose: no AI, no surprises.
 export function topPassages(p: ParsedPage, question: string, k = 5): Passage[] {
   const q = new Set(tokens(question));
   if (!q.size) return [];
   const scored: Passage[] = [];
+  const copies = new Set<Passage>();
   for (const s of p.sections) {
     const headTokens = new Set(tokens(s.heading));
+    const structured = !!s.generated && s.heading === STRUCTURED_HEADING;
     for (const block of s.blocks) {
       const bt = new Set(tokens(block.text));
       let hits = 0;
       for (const t of q) if (bt.has(t)) hits++;
       for (const t of q) if (headTokens.has(t)) hits += 0.5; // a matching heading helps a little
-      if (hits > 0) scored.push({ section: s.n, heading: s.heading, text: block.text, score: Math.round((hits / q.size) * 100) / 100 });
+      if (hits > 0) {
+        const visitor = asLevel(strongest(s.visitor ?? 0, block.visitor ?? 0));
+        const passage: Passage = { section: s.n, heading: s.heading, text: block.text, score: Math.round((hits / q.size) * 100) / 100, ...(visitor ? { visitor } : {}) };
+        scored.push(passage);
+        if (structured && block.text.length > STRUCTURED_COPY) copies.add(passage);
+      }
     }
   }
-  return scored.sort((a, b) => b.score - a.score || a.section - b.section).slice(0, k);
+  // The page's own text comes before a long line of its structured data (see STRUCTURED_COPY).
+  return scored.sort((a, b) => Number(copies.has(a)) - Number(copies.has(b)) || b.score - a.score || a.section - b.section).slice(0, k);
 }

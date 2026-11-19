@@ -3,6 +3,7 @@
 // Absent means these defaults. A bad value is a clear error, never a guess.
 import fs from "node:fs";
 import path from "node:path";
+import { isOwnerAddress } from "./guardnetwork.js";
 import { releaseLock, stillOwned, takeLock } from "./ownedlock.js";
 import { NOFOLLOW, NONBLOCK, home, ownFile, randomTmp, readOwnedText } from "./store.js";
 // W-32 (v0.9): readers of a risky setting use the value in force (an unconfirmed loosening is held back).
@@ -85,6 +86,61 @@ export function loadTranslator(): TranslatorConfig | null {
   const o = inForceConfig();
   if (!o || !Object.hasOwn(o, "translator")) return null;
   return parseTranslator(o.translator);
+}
+
+// W-38 (v1.2): the meaning check. Built like the scanner: set only by the owner (tiresias guard setup, or by editing
+// this file); nothing reachable over MCP reads, sets, changes or triggers it. It names the owner's own embedding
+// endpoint (an OpenAI-compatible API) and model. `allow_public` (written only by guard setup with the typed
+// confirmation, and a risky setting in confirm.ts) lets page text go to an address outside the owner's network.
+export interface GuardConfig {
+  url: string; // the API base, like http://localhost:1234/v1 (Tiresias posts to <url>/embeddings)
+  model: string; // the embedding model id
+  prefix: string; // put before every text sent ("" for none)
+  timeout_seconds: number; // per local read, 1 to 60, default 4
+  allow_public?: true;
+}
+export const GUARD_TIMEOUT = 4;
+const GUARD_KEYS = new Set(["url", "model", "prefix", "timeout_seconds", "allow_public"]);
+const BAD_GUARD = 'config.json: "guard" must be {"url": "http://localhost:1234/v1", "model": "<embedding model id>", "prefix": "...", "timeout_seconds": 1 to 60}. Set it with: tiresias guard setup --url <url> --model <id>';
+const CONTROL = /[\u0000-\u001f\u007f]/;
+// Addresses written as an IP that are public. A host NAME is judged when the call is made (guardclient.ts), from
+// the addresses it resolves to.
+const PUBLIC_LITERAL = (host: string, isPrivate: (ip: string) => boolean): boolean => {
+  const h = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  return /^[0-9.]+$/.test(h) || h.includes(":") ? !isPrivate(h) : false;
+};
+export function parseGuardUrl(v: unknown, isPrivate: (ip: string) => boolean = isOwnerAddress): string {
+  if (typeof v !== "string" || v.length === 0 || v.length > 2048 || CONTROL.test(v)) throw new ConfigError(BAD_GUARD);
+  let u: URL;
+  try {
+    u = new URL(v);
+  } catch {
+    throw new ConfigError('The guard "url" is not a valid address. Give the base of an OpenAI-compatible API, like http://localhost:1234/v1');
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") throw new ConfigError('The guard "url" must start with http:// or https://.');
+  if (u.username || u.password) throw new ConfigError('The guard "url" must not contain a user name or password. A key goes in the environment variable TIRESIAS_GUARD_KEY.');
+  if (u.search || u.hash || v.includes("?") || v.includes("#")) throw new ConfigError('The guard "url" must not have a query or a # part.');
+  if (u.protocol === "http:" && PUBLIC_LITERAL(u.hostname, isPrivate)) throw new ConfigError("Plain http to a public address is refused: page text would cross the internet unencrypted. Use https, or an address on your own network.");
+  return (u.origin + u.pathname).replace(/\/+$/, "");
+}
+export function parseGuard(v: unknown, isPrivate?: (ip: string) => boolean): GuardConfig {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) throw new ConfigError(BAD_GUARD);
+  const o = v as Record<string, unknown>;
+  for (const k of Object.keys(o)) if (!GUARD_KEYS.has(k)) throw new ConfigError(BAD_GUARD);
+  const url = parseGuardUrl(o.url, isPrivate);
+  if (typeof o.model !== "string" || o.model.length === 0 || o.model.length > 200 || CONTROL.test(o.model)) throw new ConfigError(BAD_GUARD);
+  const prefix = Object.hasOwn(o, "prefix") ? o.prefix : "";
+  if (typeof prefix !== "string" || prefix.length > 200 || CONTROL.test(prefix)) throw new ConfigError(BAD_GUARD);
+  const t = Object.hasOwn(o, "timeout_seconds") ? o.timeout_seconds : GUARD_TIMEOUT;
+  if (typeof t !== "number" || !Number.isSafeInteger(t) || t < 1 || t > 60) throw new ConfigError(BAD_GUARD);
+  if (Object.hasOwn(o, "allow_public") && o.allow_public !== true) throw new ConfigError(BAD_GUARD);
+  return { url, model: o.model, prefix, timeout_seconds: t, ...(o.allow_public === true ? { allow_public: true as const } : {}) };
+}
+// The meaning check of this profile, or null when none is set. A bad setting is a ConfigError.
+export function loadGuard(isPrivate?: (ip: string) => boolean): GuardConfig | null {
+  const o = inForceConfig();
+  if (!o || !Object.hasOwn(o, "guard")) return null;
+  return parseGuard(o.guard, isPrivate);
 }
 
 // The whole config.json as an object (null when there is none). A bad file is a ConfigError.
@@ -212,6 +268,7 @@ export const SECURITY_CHOICES = {
   private_spacing: ["shared", "none"],
   hook_secrets: ["hidden", "inherit"],
   text_views: ["marked", "wrapped"],
+  written_by: ["on", "off"], // W-39 (v1.2): local mode's written_by label
 } as const;
 export type SecurityChoice = keyof typeof SECURITY_CHOICES;
 export function parseChoice<K extends SecurityChoice>(name: K, value: unknown): (typeof SECURITY_CHOICES)[K][number] {
@@ -223,7 +280,7 @@ export function loadChoice<K extends SecurityChoice>(name: K): (typeof SECURITY_
   return o && Object.hasOwn(o, name) ? parseChoice(name, o[name]) : SECURITY_CHOICES[name][0];
 }
 
-const OWN_CHECK_KEYS = [...Object.keys(SECURITY_CHOICES), "doors", "sites", "translator", "rendering", "saving", "anchoring", "anchor_calendars"]; // translator: v0.7 W-26; rendering: v0.7 W-10; saving: v0.8 W-28; anchoring, anchor_calendars: v0.8 W-08
+const OWN_CHECK_KEYS = [...Object.keys(SECURITY_CHOICES), "doors", "sites", "translator", "rendering", "saving", "anchoring", "anchor_calendars", "guard"]; // translator: v0.7 W-26; rendering: v0.7 W-10; saving: v0.8 W-28; anchoring, anchor_calendars: v0.8 W-08; guard: v1.2 W-38
 export const KNOWN_KEYS = [...Object.keys(DEFAULT_LIMITS), ...SIGNING_KEYS, ...SAFETY_KEYS, "scanner", ...OWN_CHECK_KEYS];
 
 // W-30: how a first read of a site treats the six door checks. "background" (the default): the page first,

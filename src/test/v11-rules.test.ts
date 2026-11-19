@@ -106,3 +106,86 @@ test("5.5: matching robots groups and repeated directives keep the longest Crawl
   }
 });
 
+
+test("D.3: a robots body cut inside Allow fails closed for plain and compressed successes", async () => {
+  const zlib = await import("node:zlib");
+  const { safeFetch } = await import("../safety.js");
+  const { isAllowed, rulesCache } = await import("../rules.js");
+  const { throttle } = await import("../queue.js");
+  const limit = 512 * 1024;
+  const prefix = "User-agent: *\nDisallow: /private\nCrawl-delay: 120\n";
+  const allow = "\nAllow: /private";
+  const body = prefix + "#" + "x".repeat(limit - prefix.length - 1 - allow.length) + allow + "-public\n";
+  assert.equal(body.slice(0, limit).endsWith(allow), true);
+  assert.equal(isAllowed(parseRobots(body), "/private/secret"), false);
+  assert.equal(isAllowed(parseRobots(body.slice(0, limit)), "/private/secret"), true, "the shortened Allow would win");
+  const encodings = [
+    ["identity", Buffer.from(body)],
+    ["gzip", zlib.gzipSync(body)],
+    ["br", zlib.brotliCompressSync(body)],
+    ["deflate", zlib.deflateSync(body)],
+    ["deflate", zlib.deflateRawSync(body)],
+  ] as const;
+  for (const [encoding, bytes] of encodings) for (const status of [200, 201]) {
+    freshHome();
+    const s = await serve((req, res) => {
+      if (req.url !== "/robots.txt") return html(res, "<p>must not be fetched</p>");
+      res.writeHead(status, { "content-type": "text/plain", "content-encoding": encoding });
+      res.end(bytes);
+    });
+    try {
+      const fetched = await safeFetch(s.url + "/robots.txt", { maxBytes: limit, truncate: true });
+      assert.equal(fetched.truncated, true, `${encoding} HTTP ${status}`);
+      assert.equal(fetched.body.length, limit);
+      const r = await check(s.url + "/private/secret");
+      assert.equal(r.status, "refused");
+      assert.match(r.message ?? "", /larger than 512 KB.*assumes the site says no/);
+      assert.equal(s.count("/private/secret"), 0);
+      const cached = rulesCache.get(s.url)!;
+      assert.equal(cached.mode, "disallow_all");
+      assert.deepEqual(cached.rules, []);
+      assert.equal(cached.crawlDelay, 0);
+      // No Crawl-delay may be learned from the refused prefix.
+      const release = await throttle(s.url, 0, AbortSignal.timeout(500), s.url + "/probe");
+      release();
+    } finally { await s.close(); }
+  }
+});
+
+test("D.3: robots bodies at and just under 512 KB still supply rules", async () => {
+  const { isAllowed } = await import("../rules.js");
+  const prefix = "User-agent: *\nDisallow: /private\nAllow: /public\n";
+  for (const length of [512 * 1024 - 1, 512 * 1024]) {
+    freshHome();
+    const body = prefix + "#" + "x".repeat(length - prefix.length - 2) + "\n";
+    assert.equal(Buffer.byteLength(body), length);
+    const s = await serve((_req, res) => text(res, body));
+    try {
+      const r = await getRobots(s.url);
+      assert.equal(r.mode, "parsed");
+      assert.equal(isAllowed(r, "/private/secret"), false);
+      assert.equal(isAllowed(r, "/public"), true);
+      assert.equal(r.rules.length, 2);
+    } finally { await s.close(); }
+  }
+});
+
+test("D.3: safeFetch also marks a cut file stream as truncated", async () => {
+  const { safeFetch } = await import("../safety.js");
+  freshHome();
+  const s = await serve((req, res) => {
+    res.writeHead(200, { "content-type": "application/octet-stream" });
+    // Chunked, so the size is discovered during intake rather than from Content-Length.
+    res.write(Buffer.alloc(req.url === "/cut" ? 2000 : 500, 0));
+    res.end();
+  });
+  try {
+    const cut = await safeFetch(s.url + "/cut", { files: { maxBytes: 1000 } });
+    assert.equal(cut.file?.stopped, "too_large");
+    assert.equal(cut.truncated, true);
+    const whole = await safeFetch(s.url + "/whole", { files: { maxBytes: 1000 } });
+    assert.ok(whole.file?.sha256);
+    assert.equal(whole.file?.stopped, undefined);
+    assert.equal(whole.truncated, false);
+  } finally { await s.close(); }
+});

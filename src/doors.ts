@@ -60,7 +60,7 @@ export const noStore = (h: Headers) => /(^|[\s,])no-store\b/i.test(h.get("cache-
 // is not "no door": it throws, so the sequential checks stop and nothing is cached (the next read asks again).
 async function probe(url: string, maxBytes: number, ctl: AbortController, strict = false): Promise<RawResponse | null> {
   try {
-    const res = await politeFetch(url, { maxBytes, truncate: true, timeoutMs: 8000, signal: ctl.signal });
+    const res = await politeFetch(url, { robotsPass: false, maxBytes, truncate: true, timeoutMs: 8000, signal: ctl.signal });
     if (res.status === 402) throw new PaymentRequired(res.headers, res.body, res.url);
     if (strict && (res.status >= 500 || res.status === 429)) throw new FetchError(`A door check answered HTTP ${res.status}.`, "network");
     const html = /html/i.test(res.headers.get("content-type") ?? "") ? res.body : undefined;

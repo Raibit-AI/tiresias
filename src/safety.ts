@@ -488,10 +488,12 @@ type Declared = { contentType: string; names: ReturnType<typeof namesOf> };
 // only the first bytes are kept until the decision, then nothing but the running hash (and the last 512
 // bytes, for a disk image's trailer). With no `files` option (or a status that is not a success) the body
 // is kept as a page whatever it is, as before v0.5.
-async function readBody(msg: http.IncomingMessage, max: number, truncate: boolean, signal: AbortSignal, d: Declared, files?: FileOptions): Promise<Body> {
+// v1.2: `noBody` is a 204 or a 304. Neither has a body, so there is nothing to decompress, whatever
+// Content-Encoding the headers repeat (Wikipedia's 304 says gzip, and gunzipping nothing failed every revisit).
+async function readBody(msg: http.IncomingMessage, max: number, truncate: boolean, signal: AbortSignal, d: Declared, files?: FileOptions, noBody = false): Promise<Body> {
   let chosen: ReturnType<typeof decoderFor>;
   try {
-    chosen = decoderFor(msg.headers["content-encoding"] as string | undefined);
+    chosen = noBody ? null : decoderFor(msg.headers["content-encoding"] as string | undefined);
   } catch (e) {
     msg.destroy();
     throw e;
@@ -954,7 +956,7 @@ export async function safeFetch(rawUrl: string, opts: SafeFetchOptions = {}): Pr
       }
       let read: Body;
       try {
-        read = await readBody(msg, max, !!opts.truncate, ctl.signal, declared, files);
+        read = await readBody(msg, max, !!opts.truncate, ctl.signal, declared, files, status === 204 || status === 304);
       } catch (e) {
         if (e instanceof FetchError && e.code === "too_large" && mimeOf(ct) === "application/pdf") {
           throw new FetchError(`This PDF is larger than ${max} bytes${Number.isFinite(cl) && cl > 0 ? ` (the site says ${cl})` : ""}, the most Tiresias will read. It was not read.`, "too_large");
@@ -964,7 +966,7 @@ export async function safeFetch(rawUrl: string, opts: SafeFetchOptions = {}): Pr
       wire.assertUnder();
       if ("file" in read) {
         if (Number.isFinite(cl)) read.file.declared_size = String(cl);
-        return { status, headers: toHeaders(msg.headers), body: "", url: u.href, redirected, truncated: false, file: read.file };
+        return { status, headers: toHeaders(msg.headers), body: "", url: u.href, redirected, truncated: read.file.stopped !== undefined, file: read.file };
       }
       const { page: buf, truncated, verdict } = read;
       const common = { status, headers: toHeaders(msg.headers), url: u.href, redirected, truncated, size: wire.total, ...("read" in verdict ? { read: verdict.read } : {}), fileFlags: verdict.flags };

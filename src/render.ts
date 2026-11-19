@@ -35,6 +35,8 @@ import { shutdownSignal } from "./lifetime.js";
 import { READ_SLACK, fetchCap } from "./safety.js";
 import { envMayLoosen, inForceConfig } from "./confirm.js";
 import { LIMITS as INSPECT, VIEWPORT, checkInspection, inspectScript, newMark, wallVerdict, type Overlay, type WallVerdict } from "./inspect.js";
+import { STRUCTURED_HEADING } from "./reader.js";
+import type { ParsedPage } from "./types.js";
 
 // ---- the owner's setting ----
 
@@ -150,9 +152,10 @@ export function findChrome(): string | null {
 
 // ---- the empty JavaScript shell test (auto mode) ----
 
-// A page read as HTML whose text is almost nothing and that carries scripts.
-export function looksLikeShell(textChars: number, body: string): boolean {
-  return textChars < 200 && /<script\b/i.test(body);
+// v1.2: short link menus can be shells; a substantial unlinked block or a useful list of links is content.
+export function looksLikeShell(parsed: ParsedPage, hasScript: boolean): boolean {
+  return hasScript && parsed.text_chars < 200 && parsed.links.length < 20 && !parsed.sections.some(s =>
+    !(s.generated && s.heading === STRUCTURED_HEADING) && s.blocks.some(b => b.text.length >= 80 && b.marks.length === 0));
 }
 
 // ---- process lifetime ----

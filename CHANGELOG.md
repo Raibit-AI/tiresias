@@ -2,6 +2,39 @@
 
 Built from docs/SPEC.md, section 10, which has the full detail of every version.
 
+## v1.2.0 (2026-11-19)
+
+Local model mode. A model that runs on your own computer has little working memory, and the full server's 18 tools use about 4,000 tokens of it before the first question. `tiresias mcp --local` is one tool and the same reply with parts left out. In our tests a 9B model with 4,096 tokens of context answered 6 of 6 page questions right through it, against 0 of 6 through the full server. Three reader faults found on the way are fixed for everyone: Wikipedia articles and several other sites had been reading as empty pages.
+
+For local models:
+
+- `tiresias mcp --local [--local-budget n]` starts a server with one tool, `read`. Its instructions and tool list take about 200 tokens, against about 4,000. A reply is the usual envelope without the receipts list, flags, links, forms and metadata. Receipts are still written to your store. Page text is held to your budget: 6,000 characters by default, from 1,000 to 20,000.
+- `tiresias read <address> --local` prints exactly what a local model is given.
+- Text that looks written to steer an AI is handled before the model sees it. One sign puts a fixed warning on the passage. Two signs, or chat markers on their own, replace the passage with a fixed sentence saying text was withheld. This is best effort, and SECURITY.md says so with the test numbers.
+- New and optional: the meaning check. `tiresias guard setup` connects your own embedding model. Each passage a local read is about to show is compared with a library of known planted instructions and with ordinary page text, and a close match counts as one more sign. It is off until you set it up. Page text goes only to the address you give. When your model is not running, the read still works and says `"meaning_check": "not run"`. In our tests it marked 13 of 24 planted comments in a first blind set, and 5 of 24 in a second set written to use different tricks, at about 1 false alarm per 100 ordinary passages. On one more blind set, written for this release, the list that ships marked 10 of 24 planted comments and none of 24 honest ones. `guard show`, `guard check`, `guard import` and `guard off` manage it.
+- New: who wrote each passage. On a page where Tiresias finds text written by visitors (comments, reviews, answers, forum posts), each passage of a local reply carries `written_by`: the site, or a visitor to the site. Tiresias reads this from the page's own markup. It is a fact and not a warning, and nothing is withheld because of it. In lab tests with four local models it cut the planted comments a model followed from 33 to 11 of 288 tries. It is on by default, and `tiresias settings set written_by off` turns it off.
+- When a plain read finds an empty JavaScript shell and your `rendering` setting is `ask`, a local read renders the page in the same call.
+
+Reading pages, for everyone:
+
+- Every English Wikipedia article had read as an empty page, and every revisit to one failed. Both are fixed.
+- A page whose content sits inside an element named after its menu, sidebar or footer no longer reads as empty (vuejs.org, usa.gov, substack.com, kayak.com). The rule was rewritten after a fresh review: such an element is now judged on its own text. On 94 more real pages, 90 read the same and 4 gained text that had been dropped.
+- A short complete page with a script (example.com), or a page that is a list of links, is no longer called JavaScript-only.
+- The first page of a visit is faster. It no longer waits the default 1 second after the robots.txt request it was checked against. Measured on five real sites: 0.26 to 0.56 seconds, against 1.35 to 1.67 before. Every other pair of requests to a site is still at least a second apart, and a site's Crawl-delay or Retry-After is obeyed as before.
+- The full server's flags use the same patterns as local mode's check, so a reworded instruction aimed at an AI is flagged in the default reply too. Nothing is withheld in the default reply.
+
+Fixes from CodeRabbit's Deep Scan (three findings, all low):
+
+- A robots.txt larger than 512 KB is no longer cut short and parsed. The site is taken to say no.
+- Control characters in anything the command line prints are shown as visible text, so page text cannot send escape codes to your terminal.
+- When a timestamp calendar reports a Bitcoin block, the text says it is that calendar's report, and the other listed calendars are still asked for 14 days.
+
+Testing and releases:
+
+- Local mode was tested with six local models on real pages, and the planted comment tests ran on four. The method, the numbers and the scripts to run them again are in `docs/LOCAL-MODELS.md`, `docs/v1.2/findings.md` and `scripts/v12-lab/`.
+- The meaning check's example list is kept as two lists: `data/` is released and `data-next/` is the working list. A release ships only when the two are the same.
+- Cached pages are read again once (`PARSER_VERSION` 20).
+
 ## v1.1.1 (2026-11-11)
 
 Five fixes, found by CodeRabbit's first review of v1.1.0 and by the review of the fixes. Three are cases where Tiresias refused more than it needed to: they erred on the safe side, and none let a page, a site or an agent do anything. The fourth closes a gap in the same check. The fifth corrects where one unusual form is sent.

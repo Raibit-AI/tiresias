@@ -10,6 +10,8 @@ export interface CallContext {
   signal?: AbortSignal; // MCP cancellation plus the call's overall deadline
   private?: boolean; // W-14: the call keeps nothing (store writes refuse; see store.ts)
   robots?: Map<string, unknown>; // robots.txt kept for this call only, when the site said no-store
+  // Created at the call boundary, so shallow context copies share both passes and first-hop claims.
+  robotsPasses?: { pending: Map<string, RobotsPass>; attempted: Set<string> };
   sent?: { requests: number; signed: number }; // N-07: how many requests this call sent, and how many were signed
   // W-19: the Safe Browsing check for this call. Called with every hop's URL BEFORE anything is sent
   // to it (robots.txt, probes, the page, each redirect); it throws to stop the call.
@@ -28,3 +30,10 @@ export interface CallContext {
   renderBudget?: { take(bytes: number): boolean; release(reserved: number, charged: number): void }; // W-25 (v0.6): the owner's site settings that applied to this call
 }
 export const callContext = new AsyncLocalStorage<CallContext>();
+
+export interface RobotsPass {
+  origin: string;
+  last: number;
+  next: number;
+  shared?: import("./hosts.js").SpacingStamp;
+}

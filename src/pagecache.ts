@@ -10,6 +10,9 @@ export type RenderInspection = Pick<RenderTop, "walls" | "hidden_text" | "overla
 
 export interface CacheEntry extends Freshness {
   parser?: number; // reader version that produced `parsed`; older entries are re-read
+  visitor_heading_text?: true; // v1.2: source regions use extracted heading text and visible descendant attribution
+  visitor_main_scopes?: true; // v1.2: source heading regions also cover text surviving main-content selection
+  visitor_scopes?: true; // W-39: attribution includes source heading scopes and the heading's own author
   url: string; // what the caller asked for
   source_url: string; // what Tiresias chose to read (page, llms.txt, or a .md twin)
   final_url: string; // where that request ended up after redirects; validators belong to THIS URL

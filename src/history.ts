@@ -30,6 +30,10 @@ export interface HistoryEntry {
   lang?: string; // v0.7 W-26: the detected language of what was read (a code from the fixed list, or "unknown")
   rendered?: true; // v0.7 W-10: the page was rendered (its JavaScript run) in this call
   saved?: true; // v0.8 W-28: a snapshot of the page was saved in this call
+  // v1.2 W-39: a local read of a page where visitor text was found: who wrote each passage, or the page of a section,
+  // in the order shown: 0 the site, 1 to 3 a visitor, by the level of the page's markup that says so (1 a formal
+  // standard, 2 a named section, 3 a heading). Recorded whether or not the owner's written_by label is on.
+  written_by?: number[];
   // v0.9 W-32 (tool "settings"): a risky setting changed, with who made it (fixed codes and a validated site only)
   setting?: string; // the risky setting's name, or "confirmations"
   site_key?: string; // the site, for a site setting
@@ -55,13 +59,14 @@ const MAX_URL_LOG = 4096;
 const REASONS = new Set(["bot_challenge", "captcha", "login_required", "forbidden", "owner_hand_off"]); // owner_hand_off: W-25 (v0.6)
 const DOORS = new Set(["mcp", "api", "feed", "structured", "text", "none"]);
 const MAX_MATCHED = 1000;
+const MAX_WRITTEN_BY = 20; // W-39: a local reply shows at most 5 passages, or one page of a section
 const TICKETS = new Set(["created", "refused_cap"]);
 const CACHE = new Set(["fresh", "revalidated", "refetched"]);
 const FLAGS = new Set(["phishing_list", "web_risk"]);
 const SLIP_ID = /^[A-Za-z0-9_-]{24}$/;
 const FILE_KINDS = new Set(["program", "script", "shortcut", "addon", "archive", "office", "image", "media", "unknown"]);
 const SCANS = new Set(["bad", "clean", "unknown", "failed"]);
-const SETTINGS = new Set(["private_spacing", "hook_secrets", "saving", "rendering", "translator", "scanner", "anchoring", "anchor_calendars", "safe_browsing", "ports", "spacing_seconds", "never_visit", "hand_off", "confirmations"]);
+const SETTINGS = new Set(["guard", "private_spacing", "hook_secrets", "saving", "rendering", "translator", "scanner", "anchoring", "anchor_calendars", "safe_browsing", "ports", "spacing_seconds", "never_visit", "hand_off", "confirmations"]);
 const CHANGES = new Set(["looser", "stricter", "never_ask", "ask_again"]);
 const BYS = new Set(["terminal", "not_terminal"]);
 const HOWS = new Set(["phrase", "never_ask", "not_needed"]);
@@ -81,7 +86,7 @@ export function bound(e: HistoryEntry): HistoryEntry {
       over = true;
     }
   }
-  const drop = (k: "reason" | "matched" | "best_door" | "llms_txt" | "ticket" | "source" | "cache" | "flag" | "slip" | "file_kind" | "scan" | "lang" | "rendered" | "saved" | "setting" | "site_key" | "change" | "by" | "confirmed" | "event" | "memory_mb" | "revoked") => {
+  const drop = (k: "reason" | "matched" | "best_door" | "llms_txt" | "ticket" | "source" | "cache" | "flag" | "slip" | "file_kind" | "scan" | "lang" | "rendered" | "saved" | "setting" | "site_key" | "change" | "by" | "confirmed" | "event" | "memory_mb" | "revoked" | "written_by") => {
     delete e[k];
     over = true;
   };
@@ -106,6 +111,7 @@ export function bound(e: HistoryEntry): HistoryEntry {
   if (e.confirmed !== undefined && !(typeof e.confirmed === "string" && HOWS.has(e.confirmed))) drop("confirmed");
   if (e.event !== undefined && !(e.event === "memory_ceiling" || (typeof e.event === "string" && KEY_EVENTS.has(e.event)))) drop("event");
   if (e.revoked !== undefined && !(Number.isSafeInteger(e.revoked) && e.revoked >= 0 && e.revoked <= 100_000)) drop("revoked");
+  if (e.written_by !== undefined && !(Array.isArray(e.written_by) && e.written_by.length >= 1 && e.written_by.length <= MAX_WRITTEN_BY && e.written_by.every((n) => n === 0 || n === 1 || n === 2 || n === 3))) drop("written_by");
   if (e.memory_mb !== undefined && !(Number.isSafeInteger(e.memory_mb) && e.memory_mb >= 1 && e.memory_mb <= 65536)) drop("memory_mb");
   if (over) e.cut = true;
   return e;

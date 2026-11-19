@@ -24,13 +24,17 @@ export function bound<T extends { quote: string; url: string; cut?: true }>(r: T
 // sent) or "file" (a file warning). Older lines have neither: a line with `sent: "form"` is a form, one with
 // `file: "warning"` a file (whose `kind` field there was the FILE's kind), anything else a quote.
 export const RECORD_VERSION = 1;
-export function record(receipts: Receipt[]): void {
+// Returns how many of the logged copies were cut (0: the log holds every receipt whole).
+export function record(receipts: Receipt[]): number {
   const now = Date.now();
   const recorded_at = new Date(now).toISOString();
+  let cut = 0;
   for (const r of receipts) {
-    const row = bound({ v: RECORD_VERSION, kind: "quote" as const, ...r, recorded_at });
+    const row = bound<Receipt & { v: number; kind: "quote"; recorded_at: string; cut?: true }>({ v: RECORD_VERSION, kind: "quote", ...r, recorded_at });
+    if (row.cut) cut++;
     appendLine(`receipts/${utcDay(now)}.jsonl`, row);
   }
+  return cut;
 }
 
 export async function query(f: { url?: string; since?: string; page?: number }, scan: LogScan = {}): Promise<LogPage<Receipt>> {

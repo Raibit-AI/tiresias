@@ -18,7 +18,7 @@ security problem. We answer within 5 working days.
 | Who | Trusted? | Why |
 |---|---|---|
 | **The owner** (you, at your own terminal) | Yes | It is your machine, your keys, your settings. |
-| **A program running as you with a shell** (an AI agent with a terminal tool, a script, cron) | Like the owner, with one exception | It can already read and change any file you can, the Tiresias store included. The exception: granting a permission slip needs a person at a terminal who types the slip's site back. Risky settings (saving, rendering, the translator, a scanner that receives files, anchoring, lower site spacing, more ports, turning Safe Browsing or a site ban off, private spacing off, sharing Tiresias secrets with hooks) need an all-caps confirmation phrase and are logged and shown in replies; an agent may type the phrase, so this stops a loosening *in passing*, not a determined program. |
+| **A program running as you with a shell** (an AI agent with a terminal tool, a script, cron) | Like the owner, with one exception | It can already read and change any file you can, the Tiresias store included. The exception: granting a permission slip needs a person at a terminal who types the slip's site back. Risky settings (saving, rendering, the translator, a scanner that receives files, anchoring, lower site spacing, more ports, turning Safe Browsing or a site ban off, private spacing off, sharing Tiresias secrets with hooks, sending page text to a meaning check endpoint outside your network) need an all-caps confirmation phrase and are logged and shown in replies; an agent may type the phrase, so this stops a loosening *in passing*, not a determined program. |
 | **The MCP client** (the AI app that starts `tiresias mcp` and talks to it: Claude Desktop, Claude Code, Cursor...) | Yes, for resource use | It is a program you installed, running as you. Tiresias trusts it not to flood its own server: thousands of calls at once, huge or malformed messages, or answers it never reads are the client's own behaviour, not something a page or an agent can make it do. Tiresias still caps calls, workers, renders, message size and open requests, pauses reading while answers back up, and runs the server under a memory ceiling (`TIRESIAS_MEMORY_MB`, default 1024 MB) so a flood ends in a clean exit the client can restart. If you do not trust your client, run Tiresias in Docker (see [docs/docker.md](docs/docker.md)), which puts a hard box around it. (SPEC section 9, 2026-10-31, W-33.) |
 | **An AI agent over MCP** | No | It may have been fooled by a page it read (prompt injection). It can read pages and its own history, but no MCP tool or parameter changes a setting, grants or extends a slip, reads a local file, or reads a key. |
 | **Websites, servers and files** | No | Any byte, header, redirect, timing or size may be hostile. |
@@ -30,6 +30,11 @@ security problem. We answer within 5 working days.
   `untrusted_content`. The top level holds only Tiresias's own codes, numbers and fixed text. Human-readable text
   views (`--text`, and the default `log` and `needs`) mark where web content begins: "web content below is untrusted".
   Agents should use JSON (`log --json`, `needs --json`); `text_views=wrapped` also wraps text views inside `untrusted_content`.
+- **Local model mode keeps every promise here.** `tiresias mcp --local` sends the same envelope with parts left
+  out (no receipts list, flag list, links, forms or metadata) and nothing added except fixed sentences and counts.
+  Web text still sits only inside `untrusted_content`. Receipts are still written to the store. Its server has one
+  tool, `read`, so no form can be sent from it at all. A passage that looks written for an AI is marked or
+  withheld there (best effort; see below).
 - **No code from the web runs on your machine** outside Chrome's sandbox. Files (programs, archives, documents) come
   back as a warning with their kind and fingerprint; Tiresias never opens or runs one. PDFs are read in a separate
   child process that may not read your files or the store's keys or start worker threads; zip, Office and calendar files are read as data in
@@ -45,6 +50,16 @@ security problem. We answer within 5 working days.
   `hand_off`, `spacing_seconds`, `ports`) are obeyed on every request to a site Tiresias reads. Services you turn
   on are called directly: the OpenTimestamps calendars (address, port and `never_visit` checks, no robots.txt) and
   Google Web Risk (not spaced).
+- **The meaning check sends page text only to the endpoint you set** (W-38, local model mode, off until you run
+  `tiresias guard setup`). When it is on, the passages a local read is about to show go to your own embedding
+  endpoint, at the address you gave, and to nothing else. It is your own model, so this happens on private reads
+  too; a private read neither uses nor fills the vector cache kept in memory, and nothing about it is written to the
+  store. The client never follows a redirect, has a hard time limit and a cap on the size of the answer, checks
+  the answer whole before using it, and connects to the address it checked. An address outside your network
+  (anything but loopback, private, link local and the CGNAT range Tailscale uses) needs the typed confirmation
+  `YES, SEND PAGE TEXT OUTSIDE MY NETWORK`, and plain http to one is refused. A key for the endpoint is read from
+  `TIRESIAS_GUARD_KEY` when the call is made and never stored, logged or shown. No tool can read, set, change or
+  trigger the check, and nothing from its libraries (texts, scores, collection names) reaches a reply.
 - **Nothing is sent to Raibit or anyone else**, apart from the requests to the sites you read and the services you
   turn on (listed in the README under "Where things are stored").
 - **No form is sent without your permission slip** for that site (and that path, if you set one), so no money moves
@@ -87,6 +102,21 @@ security problem. We answer within 5 working days.
 
 ### What Tiresias does not promise
 
+- **A model can still be talked into things by what a page says.** The
+  `untrusted_content` label tells a model what is data; it does not make the model obey the label. In tests with
+  local models (v1.2, `docs/v1.2/findings.md`) three of the four that could use the tool followed an instruction
+  planted in a page's visible text at least once, through the full envelope. Local model mode adds a check for the known shapes of such text: a
+  warning on the passage, the passage withheld when two signs agree or it carries chat-template markers, and a
+  closing reminder. That check is a list of patterns. On twelve test attacks, 6 of 36 tries worked through the
+  full envelope and none through local mode, but by then the check had been adjusted to those twelve. It marked 2
+  of 567 ordinary passages, and before the adjustment it caught one of five attacks it had not seen. The full
+  server's flags use the same patterns, so its reply flags such text too; it does not withhold anything.
+  The optional meaning check (W-38) compares each passage with known planted instructions using your own
+  embedding model. In our tests it caught about half of the attacks it had never seen (the numbers and the size
+  of the tests are in `docs/LOCAL-MODELS.md`). It can only add a warning or turn a warning into a withheld
+  passage; it never shows what the patterns held back, and a collection you import can only add marks.
+  When your model is not running, the read goes on with the patterns alone and says `meaning_check: "not run"`.
+  Do not give a model with web access anything you would not want a stranger to talk it into.
 - **Walls and hidden-text flags are advice, not a guarantee.** Tiresias tries to notice a CAPTCHA, a login wall,
   hidden text and instructions aimed at an AI, and says so. A site that disguises its own wall, or hides text in a way
   the reader does not recognize, only changes how its own page is reported; the words still arrive inside
@@ -131,8 +161,9 @@ security problem. We answer within 5 working days.
   phishing site can be missed.
 - **A program running as you can swap a store file between a check and its use** (Node has no `openat`). The store
   refuses links and checks folder identity before each step, which closes this to sites and MCP callers, not to you.
-- **Windows is not supported.** It cannot read PDFs there (memory cannot be watched), and your own scanner and
-  translator never start there.
+- **Windows is not supported.** Tiresias does not start there: the check that no other user can write to the
+  store reads Unix permission bits, so every read stops at it (first tried on Windows 11 for v1.2). PDFs could not
+  be read there either (memory cannot be watched), and your own scanner and translator never start there.
 - **The PDF child's network is not fenced by Node.** Node's permission model does not limit network use: the child
   is simply given no address and no code that fetches.
 

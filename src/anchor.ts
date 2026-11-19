@@ -31,6 +31,8 @@ const MAX_BATCH_FILE = 8 * 1024 * 1024;
 const MAX_OTS = 64 * 1024; // a stored proof from the root (calendar answers are at most 10 KB each)
 const MAX_ANSWER = 10_000; // what the official client reads from a calendar
 const MAX_UPGRADE_REQUESTS = 200; // per run
+const BITCOIN_RETRY_DAYS = 14; // a calendar's unchecked claim must not stop other allowed calendars early
+const BITCOIN_CAVEAT = "A calendar's report is not checked against Bitcoin here. To check it, run tiresias receipts verify and follow its last step, or use the official ots verify.";
 const MAX_BUNDLE = 16 * 1024 * 1024;
 const MAX_SCAN = 2_000_000; // receipts lines looked at in one run
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -369,8 +371,8 @@ function proofBytes(stamp: ots.Stamp, leaves: number): Buffer {
 }
 
 export interface UpgradeReport {
-  batches: number; // pending batches looked at
-  completed: number; // reached a Bitcoin block in this run
+  batches: number; // batches checked for upgrades, including recent unchecked Bitcoin claims
+  completed: number; // checked batches with a calendar's Bitcoin claim (not verified)
   still_pending: number;
   not_listed: number; // pending attestations naming a calendar not on the list (never asked)
   failed: number; // requests that failed or answered something unusable
@@ -398,29 +400,34 @@ async function upgradeAll(limits: ScanLimits = {}): Promise<UpgradeReport> {
     }
     checked++;
     const b = readBatch(file);
-    if (!b || b.status !== "pending") continue;
-    rep.batches++;
+    if (!b) continue;
+    const retryClaim = Date.now() - Date.parse(b.created_at) < BITCOIN_RETRY_DAYS * 86_400_000;
+    if (b.status === "complete" && !retryClaim) continue;
     const root = Buffer.from(b.id, "hex");
     let stamp: ots.Stamp;
     try {
       stamp = ots.parse(root, Buffer.from(b.ots, "base64"));
     } catch {
+      rep.batches++;
       rep.failed++;
       continue;
     }
     let changed = false;
     const pending = ots.attestations(stamp).filter((p) => p.att.kind === "pending");
+    const canAsk = (p: typeof pending[number]) => p.att.kind === "pending" && !hasBitcoin(p.node).length && upgradeAllowed(p.att.uri, mine);
+    if (hasBitcoin(stamp).length && (!retryClaim || !pending.some(canAsk))) continue;
+    rep.batches++;
     const first = cursor && path.basename(file) === cursor.file ? cursor.att : 0;
     for (let i = first; i < pending.length; i++) {
       const p = pending[i];
-      if (p.att.kind !== "pending") continue;
+      if (p.att.kind !== "pending" || hasBitcoin(p.node).length) continue;
       if (!upgradeAllowed(p.att.uri, mine)) {
         rep.not_listed++;
         continue;
       }
       if (budget <= 0) {
         next = { file: path.basename(file), att: i };
-        rep.requests_not_asked = pending.length - i;
+        rep.requests_not_asked = pending.slice(i).filter(canAsk).length;
         break;
       }
       budget--;
@@ -432,11 +439,15 @@ async function upgradeAll(limits: ScanLimits = {}): Promise<UpgradeReport> {
           continue;
         }
         const up = ots.parse(p.msg, r.raw);
-        const trial = ots.parse(root, ots.serialize(stamp));
+        const before = ots.serialize(stamp);
+        const trial = ots.parse(root, before);
         ots.merge([...ots.nodes(trial)].find((n) => n.msg.equals(p.msg))!, up);
-        proofBytes(trial, b.leaves.length);
-        stamp = trial;
-        changed = true;
+        const after = proofBytes(trial, b.leaves.length);
+        if (!before.equals(after)) {
+          // Keep existing node references so later pending entries see answers learned in this run.
+          ots.merge(stamp, trial);
+          changed = true;
+        }
       } catch {
         rep.failed++;
       }
@@ -483,8 +494,8 @@ export async function upgrade(limits: ScanLimits = {}): Promise<{ status: "ok"; 
 }
 const upgradeText = (u: UpgradeReport): string =>
   (u.batches
-    ? `${u.batches} pending batch(es) checked: ${u.completed} now in a Bitcoin block, ${u.still_pending} still pending${u.failed ? `, ${u.failed} calendar request(s) failed` : ""}${u.not_listed ? `, ${u.not_listed} naming a calendar not on the list (not asked)` : ""}.`
-    : "No pending batches checked.") + (u.scan_incomplete ? ` Upgrade scan incomplete: ${u.batches_not_checked} batch file(s) not checked, ${u.requests_not_asked} pending request(s) not asked in the current batch; the next run resumes here.` : "");
+    ? `${u.batches} batch(es) checked: ${u.completed} reported in a Bitcoin block by a calendar, ${u.still_pending} still pending${u.failed ? `, ${u.failed} calendar request(s) failed` : ""}${u.not_listed ? `, ${u.not_listed} naming a calendar not on the list (not asked)` : ""}.`
+    : "No pending batches checked.") + (u.completed ? ` ${BITCOIN_CAVEAT}` : "") + (u.scan_incomplete ? ` Upgrade scan incomplete: ${u.batches_not_checked} batch file(s) not checked, ${u.requests_not_asked} pending request(s) not asked in the current batch; the next run resumes here.` : "");
 // After a new batch: only earlier batches are worth a word (v0.9 rehearsal: "No pending batches." right after
 // "It is pending" read as a contradiction).
 const earlierText = (u: UpgradeReport): string => (u.batches || u.scan_incomplete ? ` Earlier batches: ${upgradeText(u)}` : "");
@@ -546,7 +557,7 @@ export async function run(limits: ScanLimits = {}): Promise<AnchorReply> {
   const waiting = total - todo.length;
   return {
     status: "ok",
-    message: `Anchored ${leaves.length} fingerprint(s) (${receipts} receipt record(s), ${leaves.length - receipts} snapshot(s)) in one batch; ${accepted} of ${calendars.length} calendar(s) accepted its root. It is pending until a calendar puts it in a Bitcoin block (usually a few hours): run tiresias anchor upgrade (or tiresias anchor) later.${waiting ? ` ${waiting} more wait for the next run.` : ""}${scanText}${earlierText(u)}`,
+    message: `Anchored ${leaves.length} fingerprint(s) (${receipts} receipt record(s), ${leaves.length - receipts} snapshot(s)) in one batch; ${accepted} of ${calendars.length} calendar(s) accepted its root. It is pending until a calendar reports it in a Bitcoin block (usually a few hours): run tiresias anchor upgrade (or tiresias anchor) later.${waiting ? ` ${waiting} more wait for the next run.` : ""}${scanText}${earlierText(u)}`,
     scan_incomplete: incomplete,
     profile_batch: { id: b.id, leaves: leaves.length, receipts, snapshots: leaves.length - receipts, calendars: results },
     ...(waiting ? { waiting } : {}),
@@ -574,7 +585,7 @@ export async function status(page = 1, limits: ScanLimits = {}): Promise<{ statu
   const pending = all.filter((b) => b.status === "pending").length;
   return {
     status: "ok",
-    message: `Anchoring is ${mode}. ${all.length} batch(es): ${all.length - pending} in a Bitcoin block, ${pending} pending. ${total} fingerprint(s) not yet anchored${incomplete ? " in this part of the log (receipt scan incomplete; run anchor to continue)" : ""}.`,
+    message: `Anchoring is ${mode}. ${all.length} batch(es): ${all.length - pending} reported in a Bitcoin block by a calendar, ${pending} pending. ${total} fingerprint(s) not yet anchored${incomplete ? " in this part of the log (receipt scan incomplete; run anchor to continue)" : ""}.${all.length - pending > 0 ? ` ${BITCOIN_CAVEAT}` : ""}`,
     scan_incomplete: incomplete,
     anchoring: mode, calendars, not_yet_anchored: total, batches: all.slice((page - 1) * per, page * per), total_batches: all.length, page, pages,
   };
@@ -661,7 +672,7 @@ export async function prove(idArg: string): Promise<Bundle> {
 
 export function proveText(bd: Bundle): string {
   const what = bd.kind === "receipt" ? "receipt record" : "saved snapshot";
-  const when = bd.batch.status === "complete" ? `Its batch is in Bitcoin block(s) ${bd.batch.bitcoin.join(", ")}.` : "Its batch is still pending (not in a Bitcoin block yet): run tiresias anchor upgrade later, then prove it again for a proof that needs no calendar.";
+  const when = bd.batch.status === "complete" ? `A calendar reports its batch in Bitcoin block(s) ${bd.batch.bitcoin.join(", ")}. ${BITCOIN_CAVEAT}` : "Its batch is still pending (no calendar has reported a Bitcoin block yet): run tiresias anchor upgrade later, then prove it again for a proof that needs no calendar.";
   return `A proof for this ${what} (batch of ${bd.batch.created_at}). ${when}${bd.record ? "" : ` The ${what} itself is no longer kept here; the proof covers its fingerprint, so whoever holds it can still check it.`}`;
 }
 

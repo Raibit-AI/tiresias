@@ -5,19 +5,22 @@ import { DomHandler, Parser } from "htmlparser2";
 
 export const MAX_DOM_DEPTH = 256;
 type Attrs = Record<string, string>;
+export interface SourceScope { parent?: Attrs; end?: number }
 
 export function parseDocument(body: string) {
-  const handler = new DomHandler();
+  const handler = new DomHandler(undefined, { withStartIndices: true });
+  const source = new WeakMap<Attrs, SourceScope>();
   const opens: { start: number; end: number; attrs: Attrs }[] = [];
   // The bounded parser can forget an ancestor before its source end tag. Keep source scopes with
   // push/pop (not htmlparser2's shifting stacks), so flattening cannot turn hidden descendants into
   // shown siblings. Each attribute set refers to its original parent; the reader resolves these in
   // source order, once the page's style sheet is known, without copying attributes or walking chains.
-  const inherited: [Attrs, Attrs][] = [];
-  const scopes: { name: string; attrs: Attrs; previous?: number }[] = [];
+  const inherited: [Attrs, Attrs, boolean][] = []; // third entry: the source parent is inside code/pre
+  const scopes: { name: string; attrs: Attrs; code: boolean; previous?: number }[] = [];
   const byName = new Map<string, number>();
   const popScope = () => {
     const s = scopes.pop()!;
+    source.get(s.attrs)!.end = parser.startIndex;
     if (s.previous === undefined) byName.delete(s.name);
     else byName.set(s.name, s.previous);
   };
@@ -29,11 +32,13 @@ export function parseDocument(body: string) {
   const close = handler.onclosetag.bind(handler);
   const text = handler.ontext.bind(handler);
   handler.onopentag = (name, attrs) => {
-    if (scopes.length) inherited.push([attrs, scopes[scopes.length - 1].attrs]);
+    const parent = scopes[scopes.length - 1];
+    source.set(attrs, { parent: parent?.attrs });
+    if (parent) inherited.push([attrs, parent.attrs, parent.code]);
     const key = name.toLowerCase();
     const previous = byName.get(key);
     byName.set(key, scopes.length);
-    scopes.push({ name: key, attrs, previous });
+    scopes.push({ name: key, attrs, code: key === "code" || key === "pre" || parent?.code === true, previous });
     opens.push({ ...bounds, attrs });
     open(name, attrs);
   };
@@ -49,7 +54,7 @@ export function parseDocument(body: string) {
     if (!scope || scope.attrs === opens[opens.length - 1]?.attrs) return text(data);
     // Text after a flattened child's close (including raw text) has no element to inherit on.
     const attrs = {};
-    inherited.push([attrs, scope.attrs]);
+    inherited.push([attrs, scope.attrs, scope.code]);
     open("thidden", attrs);
     text(data);
     close();
@@ -82,6 +87,7 @@ export function parseDocument(body: string) {
       while (scopes.length > left) popScope();
     }
   }
-  new BoundedParser(handler).end(body);
-  return { doc: handler.root, flattened, inherited };
+  const parser = new BoundedParser(handler);
+  parser.end(body);
+  return { doc: handler.root, flattened, inherited, source };
 }

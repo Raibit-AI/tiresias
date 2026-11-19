@@ -1,0 +1,135 @@
+{
+ "label": "static",
+ "default_prompt_tokens": 296,
+ "default_tools": 18,
+ "onetool_prompt_tokens": 296,
+ "onetool_tools": 1,
+ "compact_prompt_tokens": 49,
+ "compact_tools": 1,
+ "local_prompt_tokens": 88,
+ "local_tools": 1,
+ "replies": [
+  {
+   "task": "mdn-402",
+   "status": "unchanged",
+   "default_tokens": 1683,
+   "compact_tokens": 370,
+   "slim_tokens": 390,
+   "flags": 13,
+   "receipts": 10,
+   "passages": 5,
+   "answer_in_passages": true,
+   "bytes": {
+    "total": 6243,
+    "passages": 1304,
+    "receipts": 2515,
+    "flag_details": 701,
+    "doors": 133,
+    "metadata": 653
+   },
+   "local_tokens": 498
+  },
+  {
+   "task": "py-json",
+   "status": "unchanged",
+   "default_tokens": 1296,
+   "compact_tokens": 352,
+   "slim_tokens": 372,
+   "flags": 0,
+   "receipts": 7,
+   "passages": 5,
+   "answer_in_passages": true,
+   "bytes": {
+    "total": 5007,
+    "passages": 1344,
+    "receipts": 1934,
+    "flag_details": 2,
+    "doors": 77,
+    "metadata": 755
+   },
+   "local_tokens": 475
+  },
+  {
+   "task": "rfc9421",
+   "status": "unchanged",
+   "default_tokens": 2562,
+   "compact_tokens": 938,
+   "slim_tokens": 941,
+   "flags": 1,
+   "receipts": 11,
+   "passages": 5,
+   "answer_in_passages": true,
+   "bytes": {
+    "total": 9372,
+    "passages": 3381,
+    "receipts": 4463,
+    "flag_details": 165,
+    "doors": 80,
+    "metadata": 381
+   },
+   "local_tokens": 1045
+  },
+  {
+   "task": "example",
+   "status": "unchanged",
+   "default_tokens": 395,
+   "compact_tokens": 110,
+   "slim_tokens": 123,
+   "flags": 0,
+   "receipts": 2,
+   "passages": 1,
+   "answer_in_passages": true,
+   "bytes": {
+    "total": 1475,
+    "passages": 217,
+    "receipts": 362,
+    "flag_details": 2,
+    "doors": 40,
+    "metadata": 13
+   },
+   "local_tokens": 226
+  },
+  {
+   "task": "wiki-oedipus",
+   "status": "unchanged",
+   "default_tokens": 3056,
+   "compact_tokens": 985,
+   "slim_tokens": 995,
+   "flags": 18,
+   "receipts": 9,
+   "passages": 5,
+   "answer_in_passages": true,
+   "bytes": {
+    "total": 11231,
+    "passages": 3672,
+    "receipts": 4430,
+    "flag_details": 1633,
+    "doors": 221,
+    "metadata": 410
+   },
+   "local_tokens": 1101
+  },
+  {
+   "task": "uscis-i765",
+   "status": "unchanged",
+   "default_tokens": 1957,
+   "compact_tokens": 454,
+   "slim_tokens": 464,
+   "flags": 17,
+   "receipts": 8,
+   "passages": 5,
+   "answer_in_passages": true,
+   "bytes": {
+    "total": 7870,
+    "passages": 1491,
+    "receipts": 1959,
+    "flag_details": 2390,
+    "doors": 40,
+    "metadata": 979
+   },
+   "local_tokens": 505
+  }
+ ],
+ "local_tool_list_tokens": 143,
+ "local_instructions_tokens": 61
+}
